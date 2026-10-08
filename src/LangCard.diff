@@ -1,0 +1,116 @@
+--- src_orig/LangCard.h	2026-09-26 17:49:42.000000000 +0000
++++ /mnt/user-data/outputs/LangCard.h	2026-09-27 00:17:20.166435813 +0000
+@@ -21,18 +21,23 @@
+ // $0000-$BFFF) + 16KB here = 64KB some software (e.g. Karateka) insists on
+ // seeing before it will run ("NAO HA 64K DE MEMORIA").
+ //
+-// Bank/read/write state is entirely controlled by soft switches at
+-// $C080-$C08F (16 mirrored addresses), decoded from the low nibble of the
+-// address exactly as real Language Card hardware does:
++// Bank/read state is controlled by soft switches at $C080-$C08F (16
++// mirrored addresses), decoded from the low nibble of the address the
++// same way a real Apple II Language Card decodes it:
+ //   bit3 (0x08) clear -> bank 2 group ($C080-$C087), set -> bank 1 group ($C088-$C08F)
+-//   low 2 bits of the group: 0 = read RAM,  write-protect
+-//                              1 = read ROM,  write-enable on 2nd consecutive read
+-//                              2 = read ROM,  write-protect
+-//                              3 = read RAM,  write-enable on 2nd consecutive read
+-// Any WRITE access to $C080-$C08F immediately write-protects again; this
+-// "double read to unlock writing" quirk is exactly how the real hardware's
+-// write-enable flip-flop works (see Apple's Language Card / "Understanding
+-// the Apple II" documentation) and several disk/tape loaders rely on it.
++//   low 2 bits of the group: 0 = read RAM
++//                              1 = read ROM
++//                              2 = read ROM
++//                              3 = read RAM
++// Unlike the real Apple II card, this board has no separate write-enable
++// flip-flop (no "read the same odd offset twice in a row" unlock dance):
++// writing to $D000-$FFFF simply lands in RAM whenever RAM is currently
++// selected for reading, and vanishes otherwise. Confirmed by tracing the
++// real Karateka tape's own memory-size check cycle-by-cycle: it only ever
++// switches between $C080 and $C088 (the *even*, read-RAM offsets) and
++// never touches $C081/$C083/$C089/$C08B (the odd, write-unlock offsets a
++// real Apple II Language Card would require), yet still expects a plain
++// `STA $D000` to stick immediately.
+ 
+ #pragma once
+ 
+@@ -68,7 +73,7 @@
+ 	void loadState(const SState& s);
+ 
+ private:
+-	void handleSwitch(const word addr, bool isWrite);
++	void handleSwitch(const word addr);
+ 	byte* ramPtr(const word addr);
+ 	void mirrorRom();
+ 
+--- src_orig/LangCard.cpp	2026-09-26 17:49:42.000000000 +0000
++++ /mnt/user-data/outputs/LangCard.cpp	2026-09-27 00:17:20.167937308 +0000
+@@ -59,34 +59,31 @@
+ }
+ 
+ /*************************************************************************************************/
+-void CLangCard::handleSwitch(const word addr, bool isWrite) {
++void CLangCard::handleSwitch(const word addr) {
+ 	const int off = addr & 0x0F;
+ 	mBank2 = (off & 0x08) == 0;
+ 	const int low2 = off & 0x03;
+ 	mReadRAM = (low2 == 0 || low2 == 3);
+-
+-	if (isWrite) {
+-		// Any write access always re-protects, regardless of offset.
+-		mWriteRAM = false;
+-		mPrewrite = false;
+-	} else {
+-		const bool triggers = (off & 1) != 0;	// offsets 1,3 (and their bank/mirror equivalents)
+-		if (triggers) {
+-			if (mPrewrite) {
+-				mWriteRAM = true;	// 2nd consecutive qualifying read: unlock writing
+-			}
+-			mPrewrite = true;
+-		} else {
+-			mWriteRAM = false;
+-			mPrewrite = false;
+-		}
+-	}
++	// TK2000's expansion board does NOT replicate the Apple II Language
++	// Card's write-enable flip-flop (the "read the same odd offset twice
++	// in a row" dance that real Apple II software, and the comment this
++	// replaces, assumed applied here too). Traced cycle-by-cycle against
++	// the real Karateka tape: its own memory-size check only ever
++	// switches between $C080 and $C088 -- the two *even* offsets that
++	// just pick "read RAM" -- and never once touches $C081/$C083/$C089/
++	// $C08B (the odd, write-unlock offsets), yet still expects a
++	// straight `STA $D000` to stick. On this board, selecting "read RAM"
++	// already implies "write RAM"; there's no separate unlock step, so
++	// mWriteRAM simply tracks mReadRAM. (mPrewrite is kept only for
++	// savestate binary compatibility; it's unused now.)
++	mWriteRAM = mReadRAM;
++	mPrewrite = false;
+ }
+ 
+ /*************************************************************************************************/
+ byte CLangCard::read(const word addr, const uint64_t cycles) {
+ 	if (addr >= 0xC080 && addr <= 0xC08F) {
+-		handleSwitch(addr, false);
++		handleSwitch(addr);
+ 		return 0xFF;	// soft switches don't drive real data onto the bus
+ 	}
+ 	// 0xD000-0xFFFF
+@@ -99,11 +96,13 @@
+ /*************************************************************************************************/
+ void CLangCard::write(const word addr, const byte data, const uint64_t cycles) {
+ 	if (addr >= 0xC080 && addr <= 0xC08F) {
+-		handleSwitch(addr, true);
++		handleSwitch(addr);
+ 		return;
+ 	}
+-	// 0xD000-0xFFFF: writes only land in RAM when write-enabled; the ROM
+-	// image itself is never modified (real hardware: writes just vanish).
++	// 0xD000-0xFFFF: writes only land in RAM when write-enabled (which,
++	// on this hardware, just means "RAM is currently selected for
++	// reading" -- see handleSwitch()); the ROM image itself is never
++	// modified (real hardware: writes just vanish when ROM is selected).
+ 	if (mWriteRAM) {
+ 		*ramPtr(addr) = data;
+ 	}

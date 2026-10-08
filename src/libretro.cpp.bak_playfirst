@@ -1,0 +1,979 @@
+// libretro core wrapper for the TK2000 emulation core (ported from
+// https://github.com/fbelavenuto/tk2000, GPL-2.0).
+//
+// This file owns nothing but the libretro glue: translating retro_run()
+// into CMachine::runFrame(), converting the SRGB framebuffer to XRGB8888,
+// forwarding the frontend's keyboard callback into the TK2000 keyboard
+// matrix, mapping a handful of joypad buttons to tape/reset controls, and
+// (de)serializing savestates. All emulation logic lives in Machine.* and
+// the classes it owns.
+
+#include "pch.h"
+#include "libretro.h"
+#include "Machine.h"
+#include "FilePicker.h"
+#include "HostPaths.h"
+#include "ZipTape.h"
+#include "CoreLog.h"
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <cctype>
+
+#include <string>
+#include <vector>
+#include <algorithm>
+#ifdef _WIN32
+#include <direct.h>
+#define TK_GETCWD_CORE _getcwd
+#else
+#include <unistd.h>
+#define TK_GETCWD_CORE getcwd
+#endif
+
+// --- Disk Control interface -------------------------------------------------
+// The libretro.h shipped with this project is a trimmed subset that doesn't
+// declare the frontend's disk-swap API, so the few pieces needed are declared
+// here (values/layout match the official libretro.h). Guarded so that dropping
+// in the official header later doesn't cause redefinition errors.
+#ifndef RETRO_ENVIRONMENT_GET_LIBRETRO_PATH
+#define RETRO_ENVIRONMENT_GET_LIBRETRO_PATH 19
+#endif
+#ifndef RETRO_ENVIRONMENT_GET_CONTENT_DIRECTORY
+#define RETRO_ENVIRONMENT_GET_CONTENT_DIRECTORY 30
+#endif
+#ifndef RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE
+#define RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE 13
+#endif
+#ifndef RETRO_ENVIRONMENT_GET_DISK_CONTROL_INTERFACE_VERSION
+#define RETRO_ENVIRONMENT_GET_DISK_CONTROL_INTERFACE_VERSION 57
+#endif
+#ifndef RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE
+#define RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE 58
+#endif
+#ifndef TK2000_DISK_CONTROL_DECLARED
+#define TK2000_DISK_CONTROL_DECLARED
+struct retro_disk_control_callback {
+	bool (RETRO_CALLCONV *set_eject_state)(bool ejected);
+	bool (RETRO_CALLCONV *get_eject_state)(void);
+	unsigned (RETRO_CALLCONV *get_image_index)(void);
+	bool (RETRO_CALLCONV *set_image_index)(unsigned index);
+	unsigned (RETRO_CALLCONV *get_num_images)(void);
+	bool (RETRO_CALLCONV *replace_image_index)(unsigned index, const struct retro_game_info* info);
+	bool (RETRO_CALLCONV *add_image_index)(void);
+};
+struct retro_disk_control_ext_callback {
+	bool (RETRO_CALLCONV *set_eject_state)(bool ejected);
+	bool (RETRO_CALLCONV *get_eject_state)(void);
+	unsigned (RETRO_CALLCONV *get_image_index)(void);
+	bool (RETRO_CALLCONV *set_image_index)(unsigned index);
+	unsigned (RETRO_CALLCONV *get_num_images)(void);
+	bool (RETRO_CALLCONV *replace_image_index)(unsigned index, const struct retro_game_info* info);
+	bool (RETRO_CALLCONV *add_image_index)(void);
+	bool (RETRO_CALLCONV *set_initial_image)(unsigned index, const char* path);
+	bool (RETRO_CALLCONV *get_image_path)(unsigned index, char* s, size_t len);
+	bool (RETRO_CALLCONV *get_image_label)(unsigned index, char* s, size_t len);
+};
+#endif
+
+namespace {
+
+// Case-insensitive "does this path end in .ext" check, used to tell a
+// tape (.ct2) apart from a disk (.dsk) in retro_load_game() below.
+bool hasExtension(const char* path, const char* ext) {
+	if (!path) {
+		return false;
+	}
+	const size_t pathLen = strlen(path);
+	const size_t extLen = strlen(ext);
+	if (pathLen < extLen + 1 || path[pathLen - extLen - 1] != '.') {
+		return false;
+	}
+	const char* suffix = path + (pathLen - extLen);
+	for (size_t i = 0; i < extLen; i++) {
+		if (tolower((unsigned char)suffix[i]) != tolower((unsigned char)ext[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+constexpr double kFps = 60.0;
+constexpr unsigned long kCyclesPerFrame = (unsigned long)((double)CPU_CLOCK / kFps);
+
+// --- Fast tape loading ---
+// CTape::play()/CCpu6502::setFullSpeed() are a no-op in this port (the
+// original SDL/Win32 app's main loop read CCpu6502::getClockRate() to
+// decide how long to sleep between frames; nothing in the libretro loop
+// ever calls it). So tape loading here always ran at strict real-time
+// 1:1 with retro_run(), same as real hardware -- a ~2 minute cassette
+// took ~2 real minutes of a static-colored screen.
+//
+// We run several internal CMachine::runFrame() calls per real
+// retro_run() call while a tape is playing, and only push video/audio
+// for the last one. CMachine already clears its audio accumulator at
+// the top of every runFrame(), so the skipped frames' audio is
+// discarded for free (i.e. the load screech is muted during turbo,
+// same as other emulators' fast-load).
+//
+// Speed is cycled in-game with RetroPad Y (instead of only living in a
+// RetroArch core-options submenu), with the current setting flashed on
+// screen via RETRO_ENVIRONMENT_SET_MESSAGE so it's visible without
+// opening any menu. The multiplier-per-frame values (index 0 = off)
+// mirror the 16x/disabled/4x/8x/32x choices from the old core option,
+// which still sets where the cycle *starts* (read once at load time)
+// for frontends where remapping a button is inconvenient.
+constexpr int kFastTapeSpeeds[] = { 1, 4, 8, 16, 32 };
+constexpr const char* kFastTapeLabels[] = { "Desligado", "4x", "8x", "16x", "32x" };
+constexpr int kFastTapeSpeedCount = sizeof(kFastTapeSpeeds) / sizeof(kFastTapeSpeeds[0]);
+constexpr int kFastTapeMaxExtraFrames = 31;	// safety cap: 32x max, so a stuck tape can't hang retro_run()
+constexpr int kFastTapeDefaultIndex = 3;		// 16x, if no core-option override is found at load time
+
+int g_fastTapeSpeedIndex = kFastTapeDefaultIndex;
+int g_fastTapeMultiplier = kFastTapeSpeeds[kFastTapeDefaultIndex];
+
+CMachine* g_machine = nullptr;
+std::vector<uint32_t> g_videoBuf;
+
+retro_environment_t g_environ_cb = nullptr;
+retro_video_refresh_t g_video_cb = nullptr;
+retro_audio_sample_batch_t g_audio_batch_cb = nullptr;
+retro_input_poll_t g_input_poll_cb = nullptr;
+retro_input_state_t g_input_state_cb = nullptr;
+retro_log_printf_t g_log_cb = nullptr;
+
+void show_message(const char* msg) {
+	if (!g_environ_cb) {
+		return;
+	}
+	struct retro_message rmsg;
+	rmsg.msg = msg;
+	rmsg.frames = 150;	// ~2.5s at 60fps -- readable but doesn't linger
+	g_environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &rmsg);
+}
+
+// --- Multi-image support (tape 1 / tape 2 ...) ---
+// A game that comes on several cassette sides (e.g. Karateka: after side 1
+// it asks "LIGUE O GRAVADOR E TECLE ESPACO" for side 2) is loaded through an
+// .m3u playlist, or by appending a second image from the RetroArch menu
+// (Disk Control -> Disk Image Append). Only tapes (.ct2) can be swapped at
+// runtime; the machine is NOT reset on a swap -- the running program keeps
+// going and just finds a different cassette in the deck.
+std::vector<std::string> g_images;
+unsigned g_imageIndex = 0;
+bool g_ejected = false;
+unsigned g_initialImage = 0;
+bool g_tapeWasPlaying = false;
+bool g_tapeEnded = false;	// tape ran to its end since it was (re)inserted
+
+std::string baseName(const std::string& path) {
+	const size_t pos = path.find_last_of("/\\");
+	return pos == std::string::npos ? path : path.substr(pos + 1);
+}
+
+bool isAbsolutePath(const std::string& p) {
+	return !p.empty() && (p[0] == '/' || p[0] == '\\' || (p.size() > 1 && p[1] == ':'));
+}
+
+// Reads an .m3u: one image per line, '#' lines are comments, relative
+// entries are resolved against the playlist's own directory.
+bool loadPlaylist(const char* m3uPath, std::vector<std::string>& out) {
+	FILE* f = fopen(m3uPath, "rb");
+	if (!f) {
+		return false;
+	}
+	std::string dir;
+	const std::string full = m3uPath;
+	const size_t slash = full.find_last_of("/\\");
+	if (slash != std::string::npos) {
+		dir = full.substr(0, slash + 1);
+	}
+	std::string line;
+	int c;
+	auto flush = [&]() {
+		while (!line.empty() && isspace((unsigned char)line.back())) line.pop_back();
+		size_t b = 0;
+		while (b < line.size() && isspace((unsigned char)line[b])) b++;
+		line.erase(0, b);
+		if (line.size() >= 3 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF) {
+			line.erase(0, 3);	// UTF-8 BOM
+		}
+		if (!line.empty() && line[0] != '#') {
+			out.push_back(isAbsolutePath(line) ? line : dir + line);
+		}
+		line.clear();
+	};
+	while ((c = fgetc(f)) != EOF) {
+		if (c == '\n') {
+			flush();
+		} else {
+			line.push_back((char)c);
+		}
+	}
+	flush();
+	fclose(f);
+	return !out.empty();
+}
+
+// Inserts a tape given by path: a raw .ct2, or a .zip holding one.
+bool loadTapeFile(const char* path) {
+	if (!g_machine) {
+		return false;
+	}
+	if (hasExtension(path, "zip")) {
+		std::vector<unsigned char> data;
+		return zipExtractFirstCt2(path, data) && g_machine->insertTapeData(data.data(), data.size());
+	}
+	return g_machine->insertTape(path);
+}
+
+// Puts image `index` in the tape deck (no reset). Returns false if the
+// slot is empty / not a tape / unreadable.
+bool insertImageAt(unsigned index, bool autoStart = false) {
+	if (!g_machine || index >= g_images.size() || g_images[index].empty()) {
+		return false;
+	}
+	const std::string& path = g_images[index];
+	if (hasExtension(path.c_str(), "dsk")) {
+		show_message("Troca de .dsk nao suportada: use fitas .ct2");
+		return false;
+	}
+	if (!loadTapeFile(path.c_str())) {
+		show_message("Falha ao ler a fita (.ct2 ou .zip com .ct2)");
+		return false;
+	}
+	g_tapeEnded = false;
+	g_tapeWasPlaying = false;
+	static char buf[512];
+	snprintf(buf, sizeof(buf), autoStart ? "Fita %u/%u: %s - carregando..."
+		: "Fita %u/%u: %s - aperte L/R (play) e ESPACO",
+		index + 1, (unsigned)g_images.size(), baseName(path).c_str());
+	show_message(buf);
+	tk2000_log("tape swapped to image %u/%u: %s", index + 1, (unsigned)g_images.size(), path.c_str());
+	return true;
+}
+
+// --- retro_disk_control_* callbacks ---
+bool RETRO_CALLCONV dc_set_eject_state(bool ejected) {
+	if (ejected == g_ejected) {
+		return true;
+	}
+	g_ejected = ejected;
+	if (!ejected) {
+		// "Insert": put whatever image is currently selected in the deck.
+		insertImageAt(g_imageIndex);
+	}
+	return true;
+}
+bool RETRO_CALLCONV dc_get_eject_state(void) { return g_ejected; }
+unsigned RETRO_CALLCONV dc_get_image_index(void) { return g_imageIndex; }
+bool RETRO_CALLCONV dc_set_image_index(unsigned index) {
+	g_imageIndex = index;
+	return true;
+}
+unsigned RETRO_CALLCONV dc_get_num_images(void) { return (unsigned)g_images.size(); }
+bool RETRO_CALLCONV dc_replace_image_index(unsigned index, const struct retro_game_info* info) {
+	if (index >= g_images.size()) {
+		return false;
+	}
+	if (!info || !info->path) {
+		g_images.erase(g_images.begin() + index);
+		if (g_imageIndex > 0 && g_imageIndex >= g_images.size()) {
+			g_imageIndex = (unsigned)g_images.size() - (g_images.empty() ? 0 : 1);
+		}
+		return true;
+	}
+	g_images[index] = info->path;
+	return true;
+}
+bool RETRO_CALLCONV dc_add_image_index(void) {
+	g_images.emplace_back();
+	return true;
+}
+bool RETRO_CALLCONV dc_set_initial_image(unsigned index, const char* /*path*/) {
+	g_initialImage = index;
+	return true;
+}
+bool RETRO_CALLCONV dc_get_image_path(unsigned index, char* s, size_t len) {
+	if (index >= g_images.size() || g_images[index].empty() || !s || len == 0) {
+		return false;
+	}
+	snprintf(s, len, "%s", g_images[index].c_str());
+	return true;
+}
+bool RETRO_CALLCONV dc_get_image_label(unsigned index, char* s, size_t len) {
+	if (index >= g_images.size() || g_images[index].empty() || !s || len == 0) {
+		return false;
+	}
+	snprintf(s, len, "%s", baseName(g_images[index]).c_str());
+	return true;
+}
+
+// --- Tape picker window (RetroPad START) ---
+// START opens a file window over the video frame (see FilePicker.h) to pick
+// the next cassette side, e.g. Karateka "disco 2" when the game asks
+// "LIGUE O GRAVADOR E TECLE ESPACO". A = choose / enter folder, B or START =
+// close. While it is open the game's own pad input is held released.
+CFilePicker g_picker;
+bool g_padGate = false;	// true after closing: ignore pad until every button is released
+bool g_prevStart = false;
+// After picking, the core answers the game's "tecle espaco" prompt itself:
+// SPACE is typed after this many frames and the tape starts playing shortly
+// after (same order as the LOADT auto-sequence). Set to false to only insert
+// the tape and leave SPACE / play (L or R) to the player.
+constexpr bool kPickerAutoStart = true;
+constexpr int kPickerAutoStartDelayFrames = 20;
+
+// Puts the picked tape in the deck (adding it to the image list, or reusing
+// its slot if it's already there, so Disk Control stays in sync).
+void pick_tape(const std::string& path) {
+	if (!g_machine) {
+		return;
+	}
+	if (g_images.empty()) {
+		// Nothing loaded yet (core started without content): behave like
+		// "Load Content" -- hard reset, insert and LOADT.
+		struct retro_game_info info {};
+		info.path = path.c_str();
+		retro_load_game(&info);
+		return;
+	}
+	unsigned idx = 0;
+	bool found = false;
+	for (unsigned i = 0; i < g_images.size(); i++) {
+		if (g_images[i] == path) {
+			idx = i;
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		g_images.push_back(path);
+		idx = (unsigned)g_images.size() - 1;
+	}
+	const unsigned prevIndex = g_imageIndex;
+	const bool prevEjected = g_ejected;
+	g_imageIndex = idx;
+	g_ejected = false;
+	if (!insertImageAt(idx, kPickerAutoStart)) {
+		g_imageIndex = prevIndex;
+		g_ejected = prevEjected;
+		if (!found) {
+			g_images.pop_back();
+		}
+		return;
+	}
+	if (kPickerAutoStart) {
+		g_machine->queueAutoType(" ", kPickerAutoStartDelayFrames);
+	}
+}
+
+// Where "roms/tk2000" lives. Looked up on every open (cheap) from: the
+// working directory, the frontend executable, this core's own folder, and
+// whatever folders the frontend reports (core path, system, save, content).
+std::string find_roms_dir() {
+	std::vector<std::string> bases;
+	char cwd[1024];
+	if (TK_GETCWD_CORE(cwd, sizeof(cwd))) {
+		bases.push_back(cwd);
+	}
+	bases.push_back(hostExeDir());
+	bases.push_back(hostCoreDir());
+	if (g_environ_cb) {
+		const char* dir = nullptr;
+		if (g_environ_cb(RETRO_ENVIRONMENT_GET_LIBRETRO_PATH, &dir) && dir && *dir) {
+			const std::string p = dir;
+			const size_t pos = p.find_last_of("/\\");
+			bases.push_back(pos == std::string::npos ? p : p.substr(0, pos));
+		}
+		for (unsigned cmd : { (unsigned)RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, (unsigned)RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY,
+				(unsigned)RETRO_ENVIRONMENT_GET_CONTENT_DIRECTORY }) {
+			dir = nullptr;
+			if (g_environ_cb(cmd, &dir) && dir && *dir) {
+				bases.push_back(dir);
+			}
+		}
+	}
+	bases.erase(std::remove(bases.begin(), bases.end(), std::string()), bases.end());
+	return CFilePicker::findRomsDir(bases);
+}
+
+void close_picker() {
+	g_picker.close();
+	g_padGate = true;
+}
+
+// Cycles Desligado -> 4x -> 8x -> 16x -> 32x -> Desligado -> ... and
+// prints the new setting to the screen. Called on a Y button press.
+void cycle_fast_tape_speed() {
+	g_fastTapeSpeedIndex = (g_fastTapeSpeedIndex + 1) % kFastTapeSpeedCount;
+	g_fastTapeMultiplier = kFastTapeSpeeds[g_fastTapeSpeedIndex];
+
+	static char buf[64];
+	snprintf(buf, sizeof(buf), "Velocidade de fita: %s", kFastTapeLabels[g_fastTapeSpeedIndex]);
+	show_message(buf);
+}
+
+// Reads the tk2000_fast_tape_load core option (if the frontend exposes
+// one, e.g. via a RetroArch submenu) just once, as the starting point
+// for the in-game Y-button cycle -- not polled every frame, so pressing
+// Y during play isn't immediately stomped back to whatever the menu
+// still says.
+void apply_initial_fast_tape_option() {
+	if (!g_environ_cb) {
+		return;
+	}
+	struct retro_variable var { "tk2000_fast_tape_load", nullptr };
+	if (!g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) || !var.value) {
+		return;
+	}
+	for (int i = 0; i < kFastTapeSpeedCount; i++) {
+		bool isOff = (kFastTapeSpeeds[i] == 1) && (strcmp(var.value, "disabled") == 0);
+		bool isMult = atoi(var.value) == kFastTapeSpeeds[i];
+		if (isOff || isMult) {
+			g_fastTapeSpeedIndex = i;
+			g_fastTapeMultiplier = kFastTapeSpeeds[i];
+			break;
+		}
+	}
+}
+
+}	// namespace
+
+// Implements the hook declared in CoreLog.h. Kept outside the anonymous
+// namespace so Cpu6502.cpp / Tape.cpp (which only see CoreLog.h) can link
+// against it, while still reading g_log_cb from this translation unit.
+void tk2000_log(const char* fmt, ...) {
+	char buf[256];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+
+	if (g_log_cb) {
+		g_log_cb(RETRO_LOG_WARN, "[tk2000] %s\n", buf);
+	}
+
+	// Always also append to a fixed file next to the core, regardless of
+	// whether the frontend wired up a working log interface -- some
+	// frontends (this custom RetroArch shell included) silently drop
+	// RETRO_ENVIRONMENT_GET_LOG_INTERFACE or never forward it anywhere
+	// visible, which made every tk2000_log() call above a no-op in
+	// practice. This file is the guaranteed fallback.
+	//
+	// NOTE: this used to fflush() on every single call. That's fine for
+	// occasional events (traps, tape end-of-data) but AN0-AN2 ($C058-
+	// $C05D) can be hit thousands of times a second by cassette bit-timing
+	// loops (see Karateka), and fflush() forces a synchronous write to
+	// disk on every call. That stalls the hot bus read/write path badly
+	// enough to desync real-time-sensitive tape decoding -- which is what
+	// was actually causing Karateka's "RETIRE SUA INTERFACE" screen, not
+	// anything about the annunciator value itself. So: give the stream a
+	// large buffer and let stdio coalesce writes; only force a flush
+	// occasionally (in case of a crash we still lose at most one buffer's
+	// worth) and unconditionally on shutdown (see retro_deinit).
+	static FILE* debugLog = [] {
+		FILE* f = fopen("tk2000_debug.log", "a");
+		if (f) {
+			static char ioBuf[1 << 16]; // 64 KiB
+			setvbuf(f, ioBuf, _IOFBF, sizeof(ioBuf));
+		}
+		return f;
+	}();
+	if (debugLog) {
+		fprintf(debugLog, "[tk2000] %s\n", buf);
+		static int pending = 0;
+		if (++pending >= 256) { // periodic safety flush, not per-call
+			fflush(debugLog);
+			pending = 0;
+		}
+	}
+}
+
+// Called from retro_deinit() so the tail of the log (whatever's still
+// sitting in stdio's buffer since the last periodic flush above) actually
+// makes it to disk instead of being lost when the core unloads.
+void tk2000_log_flush() {
+	// tk2000_log() owns `debugLog` as a function-local static; re-enter it
+	// with nothing to print just to reach the same FILE* would be hacky,
+	// so instead we just flush every open stream. Cheap, and only happens
+	// once at shutdown.
+	fflush(nullptr);
+}
+
+namespace {
+
+// Edge-detected joypad buttons (tape play/rewind should trigger once per
+// press, not once per frame the button is held).
+bool g_prevA = false;
+bool g_prevB = false;
+bool g_prevSelect = false;
+bool g_prevY = false;
+bool g_prevX = false;
+bool g_prevL = false;
+bool g_prevR = false;
+bool g_prevUp = false;
+bool g_prevDown = false;
+bool g_prevLeft = false;
+bool g_prevRight = false;
+
+void RETRO_CALLCONV core_keyboard_event(bool down, unsigned keycode, uint32_t /*character*/, uint16_t key_modifiers) {
+	if (g_machine) {
+		g_machine->keyEvent(down, keycode, key_modifiers);
+	}
+}
+
+void log_fallback(enum retro_log_level, const char*, ...) {
+	// no-op fallback when the frontend doesn't provide a log interface
+}
+
+} // namespace
+
+/*************************************************************************************************/
+void retro_set_environment(retro_environment_t cb) {
+	g_environ_cb = cb;
+
+	bool no_game = true;
+	cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_game);
+
+	static const struct retro_input_descriptor descs[] = {
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,      "Fire" },
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,      "Fire 2" },
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT, "Hard Reset (clears RAM)" },
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START,  "Escolher disco 2 (fita .ct2)" },
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,      "Play/Pause Tape" },
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,      "Play/Pause Tape" },
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,      "Velocidade" },
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,      "Teclado Virtual (Liga/Desliga)" },
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,     "Joystick Cima / Navega Teclado" },
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,   "Joystick Baixo / Navega Teclado" },
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,   "Joystick Esquerda / Navega Teclado" },
+		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT,  "Joystick Direita / Navega Teclado" },
+		{ 0 },
+	};
+	cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void*)descs);
+
+	static const struct retro_variable vars[] = {
+		{ "tk2000_fast_tape_load", "Carregamento rapido de fita (inicial; use Y no jogo p/ trocar); 16x|disabled|4x|8x|32x" },
+		{ nullptr, nullptr },
+	};
+	cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)vars);
+
+	// Disk Control (RetroArch menu: Disk Control -> eject / index / insert,
+	// and "Disk Image Append"): lets the player swap tape 1 -> tape 2 while
+	// the game is running. Prefer the extended interface when the frontend
+	// supports it (adds initial-image + image path/label), else the basic one.
+	static const struct retro_disk_control_callback dcBasic = {
+		dc_set_eject_state, dc_get_eject_state, dc_get_image_index, dc_set_image_index,
+		dc_get_num_images, dc_replace_image_index, dc_add_image_index,
+	};
+	static const struct retro_disk_control_ext_callback dcExt = {
+		dc_set_eject_state, dc_get_eject_state, dc_get_image_index, dc_set_image_index,
+		dc_get_num_images, dc_replace_image_index, dc_add_image_index,
+		dc_set_initial_image, dc_get_image_path, dc_get_image_label,
+	};
+	unsigned dcVersion = 0;
+	if (cb(RETRO_ENVIRONMENT_GET_DISK_CONTROL_INTERFACE_VERSION, &dcVersion) && dcVersion >= 1) {
+		cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE, (void*)&dcExt);
+	} else {
+		cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE, (void*)&dcBasic);
+	}
+
+	struct retro_log_callback logging;
+	if (cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &logging)) {
+		g_log_cb = logging.log;
+	} else {
+		g_log_cb = log_fallback;
+	}
+}
+
+void retro_set_video_refresh(retro_video_refresh_t cb) { g_video_cb = cb; }
+void retro_set_audio_sample(retro_audio_sample_t) { /* batch-only core */ }
+void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { g_audio_batch_cb = cb; }
+void retro_set_input_poll(retro_input_poll_t cb) { g_input_poll_cb = cb; }
+void retro_set_input_state(retro_input_state_t cb) { g_input_state_cb = cb; }
+
+/*************************************************************************************************/
+void retro_init(void) {
+	g_machine = new CMachine();
+	g_videoBuf.assign(VIDEOWIDTH * VIDEOHEIGHT, 0);
+
+	enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+	if (g_environ_cb) {
+		g_environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
+
+		struct retro_keyboard_callback kbcb;
+		kbcb.callback = core_keyboard_event;
+		g_environ_cb(RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK, &kbcb);
+	}
+}
+
+void retro_deinit(void) {
+	delete g_machine;
+	g_machine = nullptr;
+	g_videoBuf.clear();
+	tk2000_log_flush();
+}
+
+unsigned retro_api_version(void) {
+	return RETRO_API_VERSION;
+}
+
+/*************************************************************************************************/
+void retro_get_system_info(struct retro_system_info* info) {
+	memset(info, 0, sizeof(*info));
+	info->library_name = "TK2000";
+	info->library_version = "1.0";
+	info->valid_extensions = "ct2|dsk|m3u";
+	info->need_fullpath = true;	// CTape::insertCt2()/CDisk::insertDisk() read the file by path
+	info->block_extract = false;
+}
+
+void retro_get_system_av_info(struct retro_system_av_info* info) {
+	memset(info, 0, sizeof(*info));
+	info->geometry.base_width = VIDEOWIDTH;
+	info->geometry.base_height = VIDEOHEIGHT;
+	info->geometry.max_width = VIDEOWIDTH;
+	info->geometry.max_height = VIDEOHEIGHT;
+	info->geometry.aspect_ratio = 4.0f / 3.0f;
+	info->timing.fps = kFps;
+	info->timing.sample_rate = (double)SAMPLERATE;
+}
+
+void retro_set_controller_port_device(unsigned /*port*/, unsigned /*device*/) {
+}
+
+/*************************************************************************************************/
+void retro_reset(void) {
+	if (g_machine) {
+		g_machine->softReset();
+	}
+}
+
+static void poll_joypad_edges() {
+	if (!g_input_state_cb) {
+		return;
+	}
+	g_input_poll_cb();
+
+	auto pressed = [](unsigned id) {
+		return g_input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, id) != 0;
+	};
+
+	bool a = pressed(RETRO_DEVICE_ID_JOYPAD_A);
+	bool b = pressed(RETRO_DEVICE_ID_JOYPAD_B);
+	bool select = pressed(RETRO_DEVICE_ID_JOYPAD_SELECT);
+	bool start = pressed(RETRO_DEVICE_ID_JOYPAD_START);
+	bool y = pressed(RETRO_DEVICE_ID_JOYPAD_Y);
+	bool x = pressed(RETRO_DEVICE_ID_JOYPAD_X);
+	bool l = pressed(RETRO_DEVICE_ID_JOYPAD_L);
+	bool r = pressed(RETRO_DEVICE_ID_JOYPAD_R);
+	bool up = pressed(RETRO_DEVICE_ID_JOYPAD_UP);
+	bool down = pressed(RETRO_DEVICE_ID_JOYPAD_DOWN);
+	bool left = pressed(RETRO_DEVICE_ID_JOYPAD_LEFT);
+	bool right = pressed(RETRO_DEVICE_ID_JOYPAD_RIGHT);
+
+	auto remember = [&]() {
+		g_prevA = a;
+		g_prevB = b;
+		g_prevSelect = select;
+		g_prevStart = start;
+		g_prevY = y;
+		g_prevX = x;
+		g_prevL = l;
+		g_prevR = r;
+		g_prevUp = up;
+		g_prevDown = down;
+		g_prevLeft = left;
+		g_prevRight = right;
+	};
+
+	// --- Tape picker window (START) ---
+	if (start && !g_prevStart) {
+		if (g_picker.isOpen()) {
+			close_picker();
+		} else {
+			// The on-screen keyboard shares the D-pad/A: never both at once.
+			if (g_machine->isKeyboardOverlayActive()) {
+				g_machine->toggleKeyboardOverlay();
+			}
+			const bool haveCurrent = g_imageIndex < g_images.size();
+			const std::string romsDir = find_roms_dir();
+			tk2000_log("picker: roms dir = %s", romsDir.empty() ? "(not found)" : romsDir.c_str());
+			g_picker.open(haveCurrent ? g_images[g_imageIndex] : std::string(), romsDir);
+		}
+	}
+	if (g_picker.isOpen()) {
+		CFilePicker::SInput in;
+		in.up = up;
+		in.down = down;
+		in.left = left || l;
+		in.right = right || r;
+		in.ok = a;
+		in.cancel = b;
+		const CFilePicker::EResult res = g_picker.update(in);
+		if (res == CFilePicker::EResult::Chosen) {
+			const std::string path = g_picker.chosenPath();
+			close_picker();
+			pick_tape(path);
+		} else if (res == CFilePicker::EResult::Cancelled) {
+			close_picker();
+		}
+		// Keep the game's joystick/fire released while the window is up.
+		g_machine->padEvent(false, false, false, false, false, false);
+		remember();
+		return;
+	}
+	if (g_padGate) {
+		// The window just closed: the button that closed it (A/B/D-pad) is
+		// probably still down. Don't let the game see it as a press.
+		if (a || b || left || right || up || down) {
+			a = b = left = right = up = down = false;
+		} else {
+			g_padGate = false;
+		}
+	}
+
+	if ((l && !g_prevL) || (r && !g_prevR)) {
+		// If the current cassette already ran to its end and there is a
+		// next one in the playlist (.m3u / appended image), "pressing
+		// play" now means: put tape 2 in the deck and start it. (With
+		// the tape at its end play() would otherwise do nothing.)
+		if (g_tapeEnded && !g_ejected && g_imageIndex + 1 < g_images.size()) {
+			g_imageIndex++;
+			if (!insertImageAt(g_imageIndex)) {
+				g_imageIndex--;
+			}
+		}
+		g_machine->tapePlay();
+	}
+	if (select && !g_prevSelect) {
+		g_machine->hardReset();
+	}
+	if (y && !g_prevY) {
+		cycle_fast_tape_speed();
+	}
+	if (x && !g_prevX) {
+		g_machine->toggleKeyboardOverlay();
+	}
+
+	// D-pad (and A as "press") does double duty: it drives the native
+	// joystick/paddle ports during gameplay, or navigates the on-screen
+	// keyboard overlay while it's open -- never both at once.
+	if (g_machine->isKeyboardOverlayActive()) {
+		g_machine->overlayNavigate(
+			left && !g_prevLeft, right && !g_prevRight,
+			up && !g_prevUp, down && !g_prevDown,
+			a && !g_prevA);
+	} else {
+		g_machine->padEvent(left, right, up, down, a, b);
+	}
+
+	remember();
+}
+
+void retro_run(void) {
+	poll_joypad_edges();
+
+	// While a tape is playing, burn through extra internal frames before
+	// the one that actually gets displayed -- see the comment on
+	// g_fastTapeMultiplier above. Re-checking tapePlaying() inside the
+	// loop lets it stop the instant the tape finishes mid-burst instead
+	// of overshooting into the next program state.
+	if (g_machine->tapePlaying() && g_fastTapeMultiplier > 1) {
+		int extraFrames = g_fastTapeMultiplier - 1;
+		if (extraFrames > kFastTapeMaxExtraFrames) {
+			extraFrames = kFastTapeMaxExtraFrames;
+		}
+		for (int i = 0; i < extraFrames && g_machine->tapePlaying(); i++) {
+			g_machine->runFrame(kCyclesPerFrame);
+		}
+	}
+
+	g_machine->runFrame(kCyclesPerFrame);
+
+	// Remember when the cassette runs out (playing -> stopped), so that the
+	// next "play" press can bring in tape 2 -- see poll_joypad_edges().
+	{
+		const bool playing = g_machine->tapePlaying();
+		if (g_tapeWasPlaying && !playing) {
+			g_tapeEnded = true;
+		}
+		g_tapeWasPlaying = playing;
+	}
+
+	// --- Video ---
+	SRGB* fb = g_machine->getFrameBuffer();
+	g_picker.draw(fb);	// tape picker window (no-op while closed)
+	for (int i = 0; i < VIDEOWIDTH * VIDEOHEIGHT; i++) {
+		g_videoBuf[i] = (uint32_t(fb[i].red) << 16) | (uint32_t(fb[i].green) << 8) | uint32_t(fb[i].blue);
+	}
+	if (g_video_cb) {
+		g_video_cb(g_videoBuf.data(), VIDEOWIDTH, VIDEOHEIGHT, VIDEOWIDTH * sizeof(uint32_t));
+	}
+
+	// --- Audio (mono beeper -> duplicated to stereo) ---
+	size_t count = 0;
+	const int16_t* samples = g_machine->takeAudioSamples(count);
+	if (samples && count > 0 && g_audio_batch_cb) {
+		static std::vector<int16_t> stereo;
+		stereo.resize(count * 2);
+		for (size_t i = 0; i < count; i++) {
+			stereo[i * 2 + 0] = samples[i];
+			stereo[i * 2 + 1] = samples[i];
+		}
+		g_audio_batch_cb(stereo.data(), count);
+	}
+	// (The accumulator is cleared at the top of the next runFrame(), not here.)
+}
+
+/*************************************************************************************************/
+size_t retro_serialize_size(void) {
+	return g_machine ? g_machine->stateSize() : 0;
+}
+
+bool retro_serialize(void* data, size_t size) {
+	return g_machine && g_machine->saveState(data, size);
+}
+
+bool retro_unserialize(const void* data, size_t size) {
+	return g_machine && g_machine->loadState(data, size);
+}
+
+/*************************************************************************************************/
+void retro_cheat_reset(void) {}
+void retro_cheat_set(unsigned, bool, const char*) {}
+
+/*************************************************************************************************/
+bool retro_load_game(const struct retro_game_info* game) {
+	if (!g_machine) {
+		g_machine = new CMachine();
+	}
+	g_picker.close();
+	// Build the image list: a single .ct2/.dsk is a list of one; an .m3u
+	// lists the tapes in order (tape 1, tape 2, ...). Image 0 (or the
+	// frontend's remembered initial image) is what gets loaded below.
+	g_images.clear();
+	g_imageIndex = 0;
+	g_ejected = false;
+	g_tapeEnded = false;
+	g_tapeWasPlaying = false;
+	const char* loadPath = (game && game->path) ? game->path : nullptr;
+	if (loadPath && hasExtension(loadPath, "m3u")) {
+		if (!loadPlaylist(loadPath, g_images)) {
+			show_message("Falha ao ler a playlist .m3u (vazia ou nao encontrada)");
+			return false;
+		}
+		if (g_initialImage < g_images.size()) {
+			g_imageIndex = g_initialImage;
+		}
+		loadPath = g_images[g_imageIndex].c_str();
+	} else if (loadPath) {
+		g_images.push_back(loadPath);
+	}
+	g_initialImage = 0;
+	// g_machine can be reused across retro_load_game calls (loading a new
+	// tape into an already-running core, e.g. via the frontend's "load
+	// content" while a game is already playing). Without an explicit
+	// reset here, the machine just keeps running in whatever state it was
+	// already in -- screen not cleared, CPU wherever it left off -- and
+	// the "LOADT" auto-type below goes nowhere useful. A real cassette
+	// TK2000 is powered on with the tape already in the deck, so do the
+	// equivalent here: hard-reset (clears RAM too) before inserting the
+	// tape, every time a game is loaded, whether g_machine is fresh or not.
+	g_machine->hardReset();
+	// The keyboard overlay is a UI toggle, not per-game state -- if it
+	// was left open from a previous game (or a previous load in the
+	// same session, since g_machine is reused across retro_load_game
+	// calls), force it closed here so a freshly loaded game always
+	// starts with the D-pad/A driving the native joystick, not the
+	// overlay grid.
+	if (g_machine->isKeyboardOverlayActive()) {
+		g_machine->toggleKeyboardOverlay();
+	}
+	static char msgBuf[512];
+	bool isDisk = false;
+	if (loadPath) {
+		isDisk = hasExtension(loadPath, "dsk");
+		if (isDisk) {
+			if (g_machine->insertDisk(loadPath)) {
+				snprintf(msgBuf, sizeof(msgBuf), "Disco carregado: %s", loadPath);
+				if (g_log_cb) {
+					g_log_cb(RETRO_LOG_INFO, "[tk2000] disk loaded: %s\n", loadPath);
+				}
+			} else {
+				snprintf(msgBuf, sizeof(msgBuf),
+					"Falha ao ler .dsk (precisa ter exatamente 143360 bytes, 35x16x256): %s", loadPath);
+				if (g_log_cb) {
+					g_log_cb(RETRO_LOG_ERROR, "[tk2000] failed to load disk (bad size or path is not a raw .dsk): %s\n", loadPath);
+				}
+				// Nothing to boot into -- leave the machine sitting at the
+				// BASIC/monitor ROM, same as tape's failure path below.
+			}
+		} else if (loadTapeFile(loadPath)) {
+			snprintf(msgBuf, sizeof(msgBuf), "Fita carregada: %s", loadPath);
+			if (g_log_cb) {
+				g_log_cb(RETRO_LOG_INFO, "[tk2000] tape loaded: %s\n", loadPath);
+			}
+		} else {
+			snprintf(msgBuf, sizeof(msgBuf),
+				"Falha ao ler .ct2 (arquivo invalido ou nao extraido do zip): %s", loadPath);
+			if (g_log_cb) {
+				g_log_cb(RETRO_LOG_ERROR, "[tk2000] failed to load tape (bad magic or path is not a raw .ct2): %s\n", loadPath);
+			}
+			// Still boot the machine to the BASIC/monitor ROM even if the
+			// tape failed to parse — matches real hardware powering on
+			// with a bad or no cassette inserted.
+		}
+		if (g_environ_cb) {
+			struct retro_message msg;
+			msg.msg = msgBuf;
+			msg.frames = 300;	// ~5s on-screen at 60fps
+			g_environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
+		}
+	}
+	// A disk boots straight into the game (see CMachine::bootFromDisk()),
+	// so there's no "LOADT" to type and no tape to auto-play. Only queue
+	// the auto-type/auto-play sequence for an actual tape load.
+	if (!isDisk) {
+		// Auto-type "LOADT" + RETURN a moment after boot; once that's done,
+		// CMachine::updateAutoType() auto-presses play on its own (if a tape
+		// was loaded), so no button press is needed. RetroPad A still works
+		// as a manual play/pause toggle afterwards.
+		g_machine->queueAutoType("LOADT\n");
+	}
+
+	apply_initial_fast_tape_option();
+	return true;
+}
+
+bool retro_load_game_special(unsigned, const struct retro_game_info*, size_t) {
+	return false;
+}
+
+void retro_unload_game(void) {
+	g_picker.close();
+	g_padGate = false;
+	g_images.clear();
+	g_imageIndex = 0;
+	g_ejected = false;
+}
+
+unsigned retro_get_region(void) {
+	return RETRO_REGION_NTSC;
+}
+
+void* retro_get_memory_data(unsigned id) {
+	if (id == RETRO_MEMORY_SYSTEM_RAM && g_machine) {
+		return g_machine->getRamPtr();
+	}
+	return nullptr;
+}
+
+size_t retro_get_memory_size(unsigned id) {
+	if (id == RETRO_MEMORY_SYSTEM_RAM && g_machine) {
+		return g_machine->getRamSize();
+	}
+	return 0;
+}

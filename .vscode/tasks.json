@@ -1,0 +1,74 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build all",
+            "type": "shell",
+            "command": "make",
+            "args": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always"
+            },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Build (force Windows/.dll)",
+            "type": "shell",
+            "command": "make",
+            "args": ["platform=win"],
+            "group": "build",
+            "presentation": {
+                "reveal": "always"
+            },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Build smoke test (Windows)",
+            "type": "shell",
+            "command": "g++",
+            "args": [
+                "-std=c++17", "-g", "-O0",
+                "test/smoke_test.cpp",
+                "-o", "test/smoke_test.exe"
+            ],
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Build smoke test (Linux/macOS)",
+            "type": "shell",
+            "command": "g++",
+            "args": [
+                "-std=c++17", "-g", "-O0",
+                "test/smoke_test.cpp",
+                "-o", "test/smoke_test",
+                "-ldl"
+            ],
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Clean",
+            "type": "shell",
+            "command": "make",
+            "args": ["clean"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Build core + smoke test (Windows)",
+            "dependsOrder": "sequence",
+            "dependsOn": ["Build (force Windows/.dll)", "Build smoke test (Windows)"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Build core + smoke test (Linux/macOS)",
+            "dependsOrder": "sequence",
+            "dependsOn": ["Build all", "Build smoke test (Linux/macOS)"],
+            "problemMatcher": []
+        }
+    ]
+}

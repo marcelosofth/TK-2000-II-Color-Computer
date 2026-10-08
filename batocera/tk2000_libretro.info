@@ -1,0 +1,20 @@
+# Software Information
+display_name = "Microdigital TK2000"
+authors = ""
+supported_extensions = "ct2|zip"
+corename = "TK2000"
+categories = "Emulator"
+license = ""
+permissions = ""
+display_version = "1.0"
+
+# Hardware Information
+manufacturer = "Microdigital"
+systemname = "TK2000"
+systemid = "tk2000"
+
+# Libretro Features
+supports_no_game = "false"
+savestate = "false"
+
+description = "Emulador do computador Microdigital TK2000 (compativel com Apple II), com carregamento de fitas .ct2."

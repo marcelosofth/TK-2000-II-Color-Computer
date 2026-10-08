@@ -1,0 +1,38 @@
+BATOCERA:
+
+Apertar F1 para acessar o explorador de arquivos
+do Batocera, ir em /userdata/roms e criar a pasta
+"tk2000", depois copiar os jogos .zip ou .ct2
+
+Copiar o arquivo: es_systems_tk2000.cfg 
+para /userdata/system/configs/emulationstation
+---------------------------------------------------
+Em: /userdata/system abrir o arquivo: batocera.conf
+e copiar essas 2 linhas no final do arquivo:
+tk2000.emulator=libretro
+tk2000.core=tk2000
+---------------------------------------------------
+Copiar o arquivo tk2000_libretro.info dentro da pasta
+/usr/share/libretro/info
+---------------------------------------------------
+Copiar o arquivo: tk2000_libretro.so dentro da pasta
+/usr/lib/libretro e por fim no Explorador de
+arquivos apertar F4 para o CMD e digitar:
+chmod 755 /usr/lib/libretro/tk2000_libretro.so
+batocera-save-overlay
+Reiniciar!
+
+===================================================
+
+RETROARCH / WINDOWS:
+
+Copiar o arquivo: tk2000_libretro.dll para dentro
+da pasta: \RetroArch\cores
+
+Copiar o arquivo: tk2000_libretro.info para dentro
+da pasta: \RetroArch\info
+
+Apagar este arquivo para atualizar a lista de cores!
+RetroArch\info\core_info.cache
+
+Fechar e abrir novamente o Retroarch!

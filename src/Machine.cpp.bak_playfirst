@@ -1,0 +1,855 @@
+// Copyright (c) 2024 FBLabs
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+#include "pch.h"
+#include "Machine.h"
+#include "libretro.h"
+
+namespace {
+	// Frame timing for the auto-type state machine, at the fixed 60fps
+	// this core runs retro_run() at.
+	constexpr int kAutoTypeBootDelayFrames = 90;	// ~1.5s: let the ROM finish its cold-boot before "typing"
+	constexpr int kAutoTypeKeyHoldFrames   = 6;	// ~100ms key held down
+	constexpr int kAutoTypeKeyGapFrames    = 6;	// ~100ms gap before the next key
+	constexpr int kAutoPlayDelayFrames     = 30;	// ~0.5s pause after RETURN before auto-pressing play
+
+	unsigned charToKeycode(char c) {
+		c = (char)std::tolower((unsigned char)c);
+		if (c == '\n' || c == '\r') {
+			return RETROK_RETURN;
+		}
+		if (c >= 'a' && c <= 'z') {
+			return RETROK_a + (c - 'a');
+		}
+		if (c >= '0' && c <= '9') {
+			return RETROK_0 + (c - '0');
+		}
+		if (c == ' ') {
+			return RETROK_SPACE;
+		}
+		return RETROK_UNKNOWN;
+	}
+
+	// --- On-screen keyboard overlay ---
+	// Laid out to match the real TK2000 II keyboard 1:1 -- same keys,
+	// same left-to-right order, same row groupings -- drawn directly
+	// into the video frame and navigated with the D-pad, for setups
+	// with no physical keyboard attached (see
+	// CMachine::drawKeyboardOverlay/overlayNavigate).
+	struct SOverlayKey {
+		unsigned keycode;	// RETROK_* sent on tap; 0 for a key with no
+							// matrix keycode of its own (see isShift/
+							// isControl/label below)
+		char glyph;		// single-glyph icon, looked up in kFont3x5
+						// below (0 if this key uses `label` instead)
+		const char* label;	// multi-letter keycap text, e.g. "RESET"
+							// (nullptr if this key uses `glyph` instead)
+		int units;		// keycap width, in grid columns (most keys are 1)
+		bool isShift;	// latches mOverlayShiftLatched instead of tapping
+		bool isControl;	// latches mOverlayCtrlLatched instead of tapping
+	};
+	// Cursor-arrow icon sentinels, looked up in kFont3x5 below (multi-
+	// letter keys use `label` instead, drawn via overlayDrawText()).
+	constexpr char kGlyphUp = '\x04';
+	constexpr char kGlyphDown = '\x05';
+	constexpr char kGlyphLeft = '\x06';
+	constexpr char kGlyphRight = '\x07';
+
+	// RESET and REPEAT sit outside the TK2000's keyboard matrix on the
+	// real hardware (RESET is wired straight to the CPU reset line;
+	// REPEAT drives typematic auto-repeat), so neither has a matrix
+	// keycode here -- they're drawn for visual fidelity but are inert.
+	// The two FIRE keys are wired in parallel with the "." matrix cell
+	// on the real board (see CKeyboard::fireKeyEvent), so RETROK_PERIOD
+	// reproduces that directly. The keycaps for I/O/K/COLON/COMMA/
+	// PERIOD carry a second legend on the real keyboard (accented
+	// vowels, Ñ, ; , < , >) that all share the same physical key as
+	// the plain glyph shown here -- there's no separate matrix cell for
+	// the accented form, so only the primary glyph is drawn.
+	const SOverlayKey kOverlayRow0[] = {
+		{ 0, 0, "RESET", 2, false, false },
+		{ RETROK_1, '1', nullptr, 1, false, false }, { RETROK_2, '2', nullptr, 1, false, false },
+		{ RETROK_3, '3', nullptr, 1, false, false }, { RETROK_4, '4', nullptr, 1, false, false },
+		{ RETROK_5, '5', nullptr, 1, false, false }, { RETROK_6, '6', nullptr, 1, false, false },
+		{ RETROK_7, '7', nullptr, 1, false, false }, { RETROK_8, '8', nullptr, 1, false, false },
+		{ RETROK_9, '9', nullptr, 1, false, false }, { RETROK_0, '0', nullptr, 1, false, false },
+		{ 0, 0, "REPEAT", 2, false, false },
+		{ 0, 0, "RESET", 2, false, false },
+	};
+	const SOverlayKey kOverlayRow1[] = {
+		{ RETROK_PERIOD, 0, "FIRE", 2, false, false },
+		{ RETROK_q, 'Q', nullptr, 1, false, false }, { RETROK_w, 'W', nullptr, 1, false, false },
+		{ RETROK_e, 'E', nullptr, 1, false, false }, { RETROK_r, 'R', nullptr, 1, false, false },
+		{ RETROK_t, 'T', nullptr, 1, false, false }, { RETROK_y, 'Y', nullptr, 1, false, false },
+		{ RETROK_u, 'U', nullptr, 1, false, false }, { RETROK_i, 'I', nullptr, 1, false, false },
+		{ RETROK_o, 'O', nullptr, 1, false, false }, { RETROK_p, 'P', nullptr, 1, false, false },
+		{ RETROK_UP, kGlyphUp, nullptr, 1, false, false },
+		{ RETROK_DOWN, kGlyphDown, nullptr, 1, false, false },
+		{ RETROK_RETURN, 0, "RETURN", 2, false, false },
+	};
+	const SOverlayKey kOverlayRow2[] = {
+		{ 0, 0, "CONTROL", 2, false, true },
+		{ RETROK_a, 'A', nullptr, 1, false, false }, { RETROK_s, 'S', nullptr, 1, false, false },
+		{ RETROK_d, 'D', nullptr, 1, false, false }, { RETROK_f, 'F', nullptr, 1, false, false },
+		{ RETROK_g, 'G', nullptr, 1, false, false }, { RETROK_h, 'H', nullptr, 1, false, false },
+		{ RETROK_j, 'J', nullptr, 1, false, false }, { RETROK_k, 'K', nullptr, 1, false, false },
+		{ RETROK_l, 'L', nullptr, 1, false, false }, { RETROK_COLON, ':', nullptr, 1, false, false },
+		{ RETROK_LEFT, kGlyphLeft, nullptr, 1, false, false },
+		{ RETROK_RIGHT, kGlyphRight, nullptr, 1, false, false },
+		{ RETROK_PERIOD, 0, "FIRE", 2, false, false },
+	};
+	const SOverlayKey kOverlayRow3[] = {
+		{ 0, 0, "SHIFT", 2, true, false },
+		{ RETROK_z, 'Z', nullptr, 1, false, false }, { RETROK_x, 'X', nullptr, 1, false, false },
+		{ RETROK_c, 'C', nullptr, 1, false, false }, { RETROK_v, 'V', nullptr, 1, false, false },
+		{ RETROK_b, 'B', nullptr, 1, false, false }, { RETROK_n, 'N', nullptr, 1, false, false },
+		{ RETROK_m, 'M', nullptr, 1, false, false },
+		{ RETROK_COMMA, ',', nullptr, 1, false, false }, { RETROK_PERIOD, '.', nullptr, 1, false, false },
+		{ RETROK_QUESTION, '?', nullptr, 1, false, false },
+		{ 0, 0, "SHIFT", 2, true, false },
+	};
+	const SOverlayKey kOverlayRow4[] = {
+		{ RETROK_SPACE, 0, "SPACE", 10, false, false },
+	};
+
+	struct SOverlayRow { const SOverlayKey* keys; int count; };
+	const SOverlayRow kOverlayRows[] = {
+		{ kOverlayRow0, 13 }, { kOverlayRow1, 14 }, { kOverlayRow2, 14 }, { kOverlayRow3, 12 }, { kOverlayRow4, 1 },
+	};
+	constexpr int kOverlayRowCount = 5;
+
+	// 3x5 bitmap font, 3 bits/row (bit2=left..bit0=right), top row first.
+	// Digits, A-Z, the punctuation the grid above needs, and the four
+	// cursor-arrow icon sentinels (multi-letter keys like RESET/SHIFT/
+	// FIRE/RETURN/SPACE/CONTROL use their `label` string, drawn one
+	// glyph at a time via overlayDrawText(), instead of a sentinel).
+	struct SGlyph { char ch; byte rows[5]; };
+	const SGlyph kFont3x5[] = {
+		{ '0', {0b111,0b101,0b101,0b101,0b111} }, { '1', {0b010,0b110,0b010,0b010,0b111} },
+		{ '2', {0b111,0b001,0b111,0b100,0b111} }, { '3', {0b111,0b001,0b111,0b001,0b111} },
+		{ '4', {0b101,0b101,0b111,0b001,0b001} }, { '5', {0b111,0b100,0b111,0b001,0b111} },
+		{ '6', {0b111,0b100,0b111,0b101,0b111} }, { '7', {0b111,0b001,0b010,0b010,0b010} },
+		{ '8', {0b111,0b101,0b111,0b101,0b111} }, { '9', {0b111,0b101,0b111,0b001,0b111} },
+		{ 'A', {0b010,0b101,0b111,0b101,0b101} }, { 'B', {0b110,0b101,0b110,0b101,0b110} },
+		{ 'C', {0b011,0b100,0b100,0b100,0b011} }, { 'D', {0b110,0b101,0b101,0b101,0b110} },
+		{ 'E', {0b111,0b100,0b111,0b100,0b111} }, { 'F', {0b111,0b100,0b111,0b100,0b100} },
+		{ 'G', {0b011,0b100,0b101,0b101,0b011} }, { 'H', {0b101,0b101,0b111,0b101,0b101} },
+		{ 'I', {0b111,0b010,0b010,0b010,0b111} }, { 'J', {0b001,0b001,0b001,0b101,0b010} },
+		{ 'K', {0b101,0b110,0b100,0b110,0b101} }, { 'L', {0b100,0b100,0b100,0b100,0b111} },
+		{ 'M', {0b101,0b111,0b111,0b101,0b101} }, { 'N', {0b101,0b111,0b111,0b111,0b101} },
+		{ 'O', {0b010,0b101,0b101,0b101,0b010} }, { 'P', {0b110,0b101,0b110,0b100,0b100} },
+		{ 'Q', {0b010,0b101,0b101,0b111,0b011} }, { 'R', {0b110,0b101,0b110,0b110,0b101} },
+		{ 'S', {0b011,0b100,0b010,0b001,0b110} }, { 'T', {0b111,0b010,0b010,0b010,0b010} },
+		{ 'U', {0b101,0b101,0b101,0b101,0b111} }, { 'V', {0b101,0b101,0b101,0b101,0b010} },
+		{ 'W', {0b101,0b101,0b111,0b111,0b101} }, { 'X', {0b101,0b101,0b010,0b101,0b101} },
+		{ 'Y', {0b101,0b101,0b010,0b010,0b010} }, { 'Z', {0b111,0b001,0b010,0b100,0b111} },
+		{ ':', {0b000,0b010,0b000,0b010,0b000} }, { ',', {0b000,0b000,0b000,0b010,0b100} },
+		{ '.', {0b000,0b000,0b000,0b000,0b010} }, { '?', {0b111,0b001,0b010,0b000,0b010} },
+		{ kGlyphUp,    {0b010,0b101,0b111,0b010,0b010} },
+		{ kGlyphDown,  {0b010,0b010,0b111,0b101,0b010} },
+		{ kGlyphLeft,  {0b001,0b011,0b111,0b011,0b001} },
+		{ kGlyphRight, {0b100,0b110,0b111,0b110,0b100} },
+	};
+	constexpr int kFontGlyphCount = sizeof(kFont3x5) / sizeof(kFont3x5[0]);
+
+	const byte* findGlyph(char ch) {
+		for (int i = 0; i < kFontGlyphCount; i++) {
+			if (kFont3x5[i].ch == ch) {
+				return kFont3x5[i].rows;
+			}
+		}
+		return nullptr;
+	}
+
+	// Finer 5x7 bitmap font for the key legends (digits, A-Z, : , . ?),
+	// 5 bits/row (bit4=left..bit0=right), top row first. Drawn at 2x on
+	// the keycaps for thin, rounded strokes; the coarse 3x5 font above
+	// is kept only for the small text labels (RESET, SHIFT, ...).
+	struct SGlyph5x7 { char ch; byte rows[7]; };
+	const SGlyph5x7 kFont5x7[] = {
+		{ '0', {0b01110,0b10001,0b10011,0b10101,0b11001,0b10001,0b01110} },
+		{ '1', {0b00100,0b01100,0b00100,0b00100,0b00100,0b00100,0b01110} },
+		{ '2', {0b01110,0b10001,0b00001,0b00010,0b00100,0b01000,0b11111} },
+		{ '3', {0b11111,0b00010,0b00100,0b00010,0b00001,0b10001,0b01110} },
+		{ '4', {0b00010,0b00110,0b01010,0b10010,0b11111,0b00010,0b00010} },
+		{ '5', {0b11111,0b10000,0b11110,0b00001,0b00001,0b10001,0b01110} },
+		{ '6', {0b00110,0b01000,0b10000,0b11110,0b10001,0b10001,0b01110} },
+		{ '7', {0b11111,0b00001,0b00010,0b00100,0b01000,0b01000,0b01000} },
+		{ '8', {0b01110,0b10001,0b10001,0b01110,0b10001,0b10001,0b01110} },
+		{ '9', {0b01110,0b10001,0b10001,0b01111,0b00001,0b00010,0b01100} },
+		{ 'A', {0b01110,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001} },
+		{ 'B', {0b11110,0b10001,0b10001,0b11110,0b10001,0b10001,0b11110} },
+		{ 'C', {0b01110,0b10001,0b10000,0b10000,0b10000,0b10001,0b01110} },
+		{ 'D', {0b11100,0b10010,0b10001,0b10001,0b10001,0b10010,0b11100} },
+		{ 'E', {0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b11111} },
+		{ 'F', {0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b10000} },
+		{ 'G', {0b01110,0b10001,0b10000,0b10111,0b10001,0b10001,0b01111} },
+		{ 'H', {0b10001,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001} },
+		{ 'I', {0b01110,0b00100,0b00100,0b00100,0b00100,0b00100,0b01110} },
+		{ 'J', {0b00111,0b00010,0b00010,0b00010,0b00010,0b10010,0b01100} },
+		{ 'K', {0b10001,0b10010,0b10100,0b11000,0b10100,0b10010,0b10001} },
+		{ 'L', {0b10000,0b10000,0b10000,0b10000,0b10000,0b10000,0b11111} },
+		{ 'M', {0b10001,0b11011,0b10101,0b10101,0b10001,0b10001,0b10001} },
+		{ 'N', {0b10001,0b10001,0b11001,0b10101,0b10011,0b10001,0b10001} },
+		{ 'O', {0b01110,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110} },
+		{ 'P', {0b11110,0b10001,0b10001,0b11110,0b10000,0b10000,0b10000} },
+		{ 'Q', {0b01110,0b10001,0b10001,0b10001,0b10101,0b10010,0b01101} },
+		{ 'R', {0b11110,0b10001,0b10001,0b11110,0b10100,0b10010,0b10001} },
+		{ 'S', {0b01111,0b10000,0b10000,0b01110,0b00001,0b00001,0b11110} },
+		{ 'T', {0b11111,0b00100,0b00100,0b00100,0b00100,0b00100,0b00100} },
+		{ 'U', {0b10001,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110} },
+		{ 'V', {0b10001,0b10001,0b10001,0b10001,0b10001,0b01010,0b00100} },
+		{ 'W', {0b10001,0b10001,0b10001,0b10101,0b10101,0b10101,0b01010} },
+		{ 'X', {0b10001,0b10001,0b01010,0b00100,0b01010,0b10001,0b10001} },
+		{ 'Y', {0b10001,0b10001,0b01010,0b00100,0b00100,0b00100,0b00100} },
+		{ 'Z', {0b11111,0b00001,0b00010,0b00100,0b01000,0b10000,0b11111} },
+		{ ':', {0b00000,0b00100,0b00100,0b00000,0b00100,0b00100,0b00000} },
+		{ ',', {0b00000,0b00000,0b00000,0b00000,0b00110,0b00100,0b01000} },
+		{ '.', {0b00000,0b00000,0b00000,0b00000,0b00000,0b01100,0b01100} },
+		{ '?', {0b01110,0b10001,0b00001,0b00010,0b00100,0b00000,0b00100} },
+	};
+	constexpr int kFont5x7Count = sizeof(kFont5x7) / sizeof(kFont5x7[0]);
+
+	const byte* findGlyph5x7(char ch) {
+		for (int i = 0; i < kFont5x7Count; i++) {
+			if (kFont5x7[i].ch == ch) {
+				return kFont5x7[i].rows;
+			}
+		}
+		return nullptr;
+	}
+
+	// Panel geometry: bottom of the 280x192 frame, centered horizontally.
+	// kOverlayCols is the widest row in grid units (rows 0-2 are all 16
+	// units wide: e.g. row0 = RESET(2) + ten digits(10) + REPEAT(2) +
+	// RESET(2)); narrower rows (SHIFT row, SPACE bar) are centered
+	// within that same panel width, same as on the real keyboard.
+	constexpr int kOverlayCellW = 17;
+	constexpr int kOverlayCellH = 18;
+	constexpr int kOverlayCols = 16;
+	constexpr int kOverlayPanelW = kOverlayCellW * kOverlayCols;
+	constexpr int kOverlayPanelH = kOverlayCellH * kOverlayRowCount;
+	constexpr int kOverlayX0 = (VIDEOWIDTH - kOverlayPanelW) / 2;
+	constexpr int kOverlayY0 = VIDEOHEIGHT - kOverlayPanelH;
+
+	inline void overlaySetPixel(SRGB* fb, int x, int y, SRGB c) {
+		if (x < 0 || x >= VIDEOWIDTH || y < 0 || y >= VIDEOHEIGHT) {
+			return;
+		}
+		fb[y * VIDEOWIDTH + x] = c;
+	}
+	inline void overlayFillRect(SRGB* fb, int x0, int y0, int w, int h, SRGB c) {
+		for (int y = y0; y < y0 + h; y++) {
+			for (int x = x0; x < x0 + w; x++) {
+				overlaySetPixel(fb, x, y, c);
+			}
+		}
+	}
+
+	// Cursor-arrow icon: solid triangular head + straight shaft, drawn
+	// pixel by pixel (1:1, no scaling) so it reads as a real arrow
+	// instead of the cross-like shape the 3x5 font produced when
+	// blown up. dir: 0=up, 1=down, 2=left, 3=right. Vertical arrows
+	// are 9 wide x 10 tall, horizontal ones 10 x 9.
+	inline void overlayDrawArrow(SRGB* fb, int x0, int y0, int dir, SRGB c) {
+		for (int v = 0; v < 10; v++) {
+			for (int u = 0; u < 9; u++) {
+				int d = u - 4;
+				if (d < 0) {
+					d = -d;
+				}
+				const bool on = (v <= 4) ? (d <= v) : (d <= 1);
+				if (!on) {
+					continue;
+				}
+				const int vv = (dir == 1 || dir == 3) ? 9 - v : v;
+				if (dir < 2) {
+					overlaySetPixel(fb, x0 + u, y0 + vv, c);
+				} else {
+					overlaySetPixel(fb, x0 + vv, y0 + u, c);
+				}
+			}
+		}
+	}
+
+	// Small text helper for the case-badge legend drawn above the key
+	// grid (see drawKeyboardOverlay) -- reuses the 3x5 font, one glyph
+	// per character with a 1px gap, spaces just advance the cursor.
+	constexpr int kOverlayHeaderH = 9;	// badge text band, above the rainbow stripe
+	constexpr int kOverlayTextScale = 1;
+
+	int overlayTextWidth(const char* text) {
+		int w = 0;
+		for (const char* p = text; *p; p++) {
+			w += 3 * kOverlayTextScale + 1;
+		}
+		return w > 0 ? w - 1 : 0;
+	}
+	void overlayDrawText(SRGB* fb, int x, int y, const char* text, SRGB color) {
+		for (const char* p = text; *p; p++) {
+			const char ch = (char)std::toupper((unsigned char)*p);
+			const byte* glyphRows = findGlyph(ch);
+			if (glyphRows) {
+				for (int gy = 0; gy < 5; gy++) {
+					for (int gx = 0; gx < 3; gx++) {
+						if (glyphRows[gy] & (1 << (2 - gx))) {
+							overlayFillRect(fb, x + gx * kOverlayTextScale, y + gy * kOverlayTextScale,
+								kOverlayTextScale, kOverlayTextScale, color);
+						}
+					}
+				}
+			}
+			x += 3 * kOverlayTextScale + 1;
+		}
+	}
+}
+
+/*************************************************************************************************/
+CMachine::CMachine() {
+	mBus.resetAll();
+	mAudio.attach(this);
+	mAudioAccum.reserve(NUMSAMPLESPERUPDATE);
+}
+
+/*************************************************************************************************/
+void CMachine::notify(sAudioMsg& m) {
+	// Called from CAudio::update() with whatever samples it generated
+	// since the previous tick. Just append to this frame's accumulator;
+	// libretro.cpp drains it once per retro_run() via takeAudioSamples().
+	mAudioAccum.insert(mAudioAccum.end(), m.bufferPtr, m.bufferPtr + m.count);
+}
+
+/*************************************************************************************************/
+void CMachine::runFrame(unsigned long cyclesPerFrame) {
+	updateAutoType();
+	updateOverlayTap();
+
+	mAudioAccum.clear();
+	const uint64_t startCycles = mCpu.getCumulativeCycles();
+	while ((mCpu.getCumulativeCycles() - startCycles) < cyclesPerFrame) {
+		mCpu.executeOpcode();
+	}
+	// Drive video/audio/tape device updates for the cycles just executed
+	// (mirrors the original mBus.updateAll() call at the end of each CPU
+	// worker-thread tick).
+	mBus.updateAll(mCpu.getCumulativeCycles());
+}
+
+/*************************************************************************************************/
+SRGB* CMachine::getFrameBuffer() {
+	SRGB* fb = mVideo.getFrameBuffer();
+	if (mOverlayActive) {
+		drawKeyboardOverlay(fb);
+	}
+	return fb;
+}
+
+/*************************************************************************************************/
+const int16_t* CMachine::takeAudioSamples(size_t& count) {
+	count = mAudioAccum.size();
+	const int16_t* ptr = mAudioAccum.empty() ? nullptr : mAudioAccum.data();
+	return ptr;
+}
+
+/*************************************************************************************************/
+void CMachine::softReset() {
+	mBus.resetAll();
+}
+
+/*************************************************************************************************/
+void CMachine::hardReset() {
+	mRam.init();
+	mLangCard.clearRam();
+	mBus.resetAll();
+}
+
+/*************************************************************************************************/
+void CMachine::keyEvent(bool down, unsigned keycode, uint16_t mod) {
+	mKeyboard.keyEvent(down, keycode, mod);
+}
+
+/*************************************************************************************************/
+void CMachine::queueAutoType(const char* text, int bootDelayFrames) {
+	mAutoTypeText = text ? text : "";
+	mAutoTypeIndex = 0;
+	mAutoTypeState = EAutoTypeState::WaitBoot;
+	mAutoTypeTimer = (bootDelayFrames >= 0) ? bootDelayFrames : kAutoTypeBootDelayFrames;
+}
+
+/*************************************************************************************************/
+void CMachine::updateAutoType() {
+	if (mAutoTypeState == EAutoTypeState::Idle) {
+		return;
+	}
+	if (mAutoTypeTimer > 0) {
+		mAutoTypeTimer--;
+		return;
+	}
+	if (mAutoTypeState == EAutoTypeState::WaitBoot) {
+		mAutoTypeState = EAutoTypeState::KeyDown;
+		// fall through to press the first key this same frame
+	}
+	if (mAutoTypeState == EAutoTypeState::KeyDown) {
+		if (mAutoTypeIndex >= mAutoTypeText.size()) {
+			// Finished typing (e.g. "LOADT\n"). If a tape was actually
+			// loaded, auto-press play a moment later instead of making
+			// the user reach for the RetroPad A button themselves.
+			if (mTapeLoaded) {
+				mAutoTypeState = EAutoTypeState::WaitAutoPlay;
+				mAutoTypeTimer = kAutoPlayDelayFrames;
+			} else {
+				mAutoTypeState = EAutoTypeState::Idle;
+			}
+			return;
+		}
+		mKeyboard.keyEvent(true, charToKeycode(mAutoTypeText[mAutoTypeIndex]), 0);
+		mAutoTypeState = EAutoTypeState::KeyUp;
+		mAutoTypeTimer = kAutoTypeKeyHoldFrames;
+		return;
+	}
+	if (mAutoTypeState == EAutoTypeState::KeyUp) {
+		mKeyboard.keyEvent(false, charToKeycode(mAutoTypeText[mAutoTypeIndex]), 0);
+		mAutoTypeIndex++;
+		mAutoTypeState = EAutoTypeState::KeyDown;
+		mAutoTypeTimer = kAutoTypeKeyGapFrames;
+		return;
+	}
+	if (mAutoTypeState == EAutoTypeState::WaitAutoPlay) {
+		mTape.play();
+		mAutoTypeState = EAutoTypeState::Idle;
+		return;
+	}
+}
+
+/*************************************************************************************************/
+bool CMachine::insertTape(const char* fileName) {
+	mTapeLoaded = mTape.insertCt2(fileName);
+	return mTapeLoaded;
+}
+
+/*************************************************************************************************/
+bool CMachine::insertTapeData(const byte* data, size_t size) {
+	mTapeLoaded = mTape.insertCt2Data(data, size);
+	return mTapeLoaded;
+}
+
+/*************************************************************************************************/
+bool CMachine::insertDisk(const char* fileName) {
+	if (!mDisk.insertDisk(fileName)) {
+		return false;
+	}
+	bootFromDisk();
+	return true;
+}
+
+/*************************************************************************************************/
+void CMachine::bootFromDisk() {
+	// Real Disk ][ boot ROM behaviour: track 0 / sector 0's own first
+	// byte says how many sectors of track 0 to load (normally just 1)
+	// into consecutive pages starting at $0800; execution then continues
+	// at $0801. From there on DOS 3.3's own RWTS (baked into the disk,
+	// unmodified) drives $C0E0-$C0EF directly for everything else.
+	const byte* sector0 = mDisk.rawTrack0Sector(0);
+	byte sectorCount = sector0[0];
+	if (sectorCount == 0 || sectorCount > CDisk::kSectorsPerTrack) {
+		sectorCount = 1;
+	}
+	for (byte s = 0; s < sectorCount; s++) {
+		memcpy(&mRam.mRam[0x0800 + s * 0x100], mDisk.rawTrack0Sector(s), CDisk::kSectorSize);
+	}
+	// This core only emulates the disk controller in slot 6 (see
+	// Disk.h), so this is the same fixed $60 a real boot ROM in that
+	// slot would use. Boot1 (loaded above, unmodified, at $0800) reads
+	// it back out of A/X and/or zero page $2B -- both are set here
+	// since which one a given DOS 3.3 boot1 variant relies on isn't
+	// worth gambling on.
+	constexpr byte kSlot16 = 0x60;
+	mRam.mRam[0x2B] = kSlot16;
+	// Real boot0 reads sector 0 through its own ($26/$27) destination
+	// pointer, which is left pointing at the *next* page ($0900) when it
+	// jumps to $0801. Boot1 checks for exactly that ($27 == $09) as its
+	// very first instruction and, if so, runs its own setup: it works
+	// out where the rest of the boot image goes ($08FE + $08FF -> page
+	// $BE on this disk, counting down) and points its indirect
+	// "ReadSector" vector ($3E/$3F) at this slot's $C65C. Without $27 ==
+	// $09 that setup is skipped and every later page lands one page too
+	// low -- see the $C65C trap in Cpu6502::executeOpcode() for what
+	// actually answers those ReadSector calls, since this core has no
+	// real ROM there.
+	mRam.mRam[0x26] = 0x00;
+	mRam.mRam[0x27] = 0x09;
+	mCpu.setBootRegs(kSlot16, kSlot16, 0x00);
+	mCpu.setPC(0x0801);
+}
+
+/*************************************************************************************************/
+void CMachine::tapePlay() {
+	mTape.play();
+}
+
+/*************************************************************************************************/
+void CMachine::tapeRewind() {
+	mTape.rewind();
+}
+
+/*************************************************************************************************/
+bool CMachine::tapePlaying() const {
+	return mTape.getPlayState();
+}
+
+/*************************************************************************************************/
+void CMachine::padEvent(bool left, bool right, bool up, bool down, bool button0, bool button1) {
+	mJoystick.padEvent(left, right, up, down, button0, button1);
+	// Real TK2000 FIRE keys are wired to both the joystick button lines
+	// (above) and the keyboard matrix at once -- mirror that here so
+	// games that poll the keyboard for FIRE (e.g. Bombardeiro.ct2)
+	// respond to A/B the same as games that read $C061/$C062 directly.
+	mKeyboard.fireKeyEvent(button0 || button1);
+	// Same idea for movement: drive the LFT/RGT/DWN/UP cursor keys
+	// alongside the paddle values, since some games (Bombardeiro.ct2
+	// included) read those instead of $C064/$C065.
+	mKeyboard.dirKeyEvent(left, right, up, down);
+}
+
+/*************************************************************************************************/
+void CMachine::toggleKeyboardOverlay() {
+	mOverlayActive = !mOverlayActive;
+	if (mOverlayActive) {
+		// Release whatever the joystick was doing at the moment the
+		// overlay opens -- otherwise a direction held right as you
+		// switch to typing would keep "steering" the paddle in the
+		// background for as long as the overlay stays up.
+		mJoystick.padEvent(false, false, false, false, false, false);
+		mKeyboard.fireKeyEvent(false);
+		mKeyboard.dirKeyEvent(false, false, false, false);
+	}
+}
+
+/*************************************************************************************************/
+void CMachine::overlayNavigate(bool left, bool right, bool up, bool down, bool select) {
+	if (!mOverlayActive) {
+		return;
+	}
+
+	int rowLen = kOverlayRows[mOverlayRow].count;
+	if (left) {
+		mOverlayCol = (mOverlayCol - 1 + rowLen) % rowLen;
+	}
+	if (right) {
+		mOverlayCol = (mOverlayCol + 1) % rowLen;
+	}
+	if (up) {
+		mOverlayRow = (mOverlayRow - 1 + kOverlayRowCount) % kOverlayRowCount;
+	}
+	if (down) {
+		mOverlayRow = (mOverlayRow + 1) % kOverlayRowCount;
+	}
+	if (up || down) {
+		const int newLen = kOverlayRows[mOverlayRow].count;
+		if (mOverlayCol >= newLen) {
+			mOverlayCol = newLen - 1;
+		}
+	}
+
+	if (select) {
+		const SOverlayKey& key = kOverlayRows[mOverlayRow].keys[mOverlayCol];
+		if (key.isShift) {
+			mOverlayShiftLatched = !mOverlayShiftLatched;
+			return;
+		}
+		if (key.isControl) {
+			// Unlike SHIFT (folded into the `mod` of every subsequent
+			// tap), CTRL is its own held key on the real matrix -- send
+			// it straight through so mCtrl flips immediately and stays
+			// latched until CONTROL is selected again.
+			mOverlayCtrlLatched = !mOverlayCtrlLatched;
+			mKeyboard.keyEvent(mOverlayCtrlLatched, RETROK_LCTRL, 0);
+			return;
+		}
+		if (key.keycode == 0) {
+			// RESET / REPEAT: drawn for visual fidelity with the real
+			// keyboard, but neither has a matrix cell to send (see the
+			// comment above kOverlayRow0), so selecting them is a no-op.
+			return;
+		}
+		// Tap: press now, release a few frames later via
+		// updateOverlayTap() -- mirrors the auto-type state machine's
+		// KeyDown/KeyUp pair above.
+		mOverlayTapKeycode = key.keycode;
+		mOverlayTapTimer = 4;
+		const uint16_t mod = mOverlayShiftLatched ? RETROKMOD_SHIFT : 0;
+		mKeyboard.keyEvent(true, mOverlayTapKeycode, mod);
+	}
+}
+
+/*************************************************************************************************/
+void CMachine::updateOverlayTap() {
+	if (mOverlayTapTimer <= 0) {
+		return;
+	}
+	mOverlayTapTimer--;
+	if (mOverlayTapTimer == 0) {
+		const uint16_t mod = mOverlayShiftLatched ? RETROKMOD_SHIFT : 0;
+		mKeyboard.keyEvent(false, mOverlayTapKeycode, mod);
+	}
+}
+
+/*************************************************************************************************/
+void CMachine::drawKeyboardOverlay(SRGB* fb) {
+	// Palette echoing the real TK2000's cream case / near-black keycaps
+	// (see MicroDigital's original keyboard) instead of the old flat
+	// blue-and-yellow scheme.
+	const SRGB bg{ 214, 198, 152 };			// cream case
+	const SRGB keyBg{ 34, 32, 30 };			// near-black keycap
+	const SRGB keyBgShiftOn{ 150, 42, 30 };	// latched SHIFT: FIRE-red
+	const SRGB selBg{ 232, 96, 28 };			// selection: FIRE-red/orange
+	const SRGB keyEdgeHi{ 70, 68, 64 };		// keycap top/left bevel highlight
+	const SRGB keyEdgeLo{ 12, 11, 10 };		// keycap bottom/right bevel shadow
+	const SRGB glyphOn{ 230, 226, 216 };		// off-white legend
+	const SRGB glyphOnSel{ 25, 15, 8 };		// dark legend on bright selection
+
+	overlayFillRect(fb, kOverlayX0 - 2, kOverlayY0 - 2 - kOverlayHeaderH, kOverlayPanelW + 4, kOverlayPanelH + 4 + kOverlayHeaderH, bg);
+
+	// Case-badge legend, like the "TK2000 color computer ... MICRODIGITAL"
+	// text on the real unit's case, sitting just above the rainbow stripe.
+	{
+		const SRGB textColor{ 40, 34, 26 };
+		const char* leftText = "TK 2000 II/Color Computer";
+		const char* rightText = "MICRODIGITAL";
+		const int textY = kOverlayY0 - 2 - kOverlayHeaderH + 2;
+		overlayDrawText(fb, kOverlayX0 + 2, textY, leftText, textColor);
+		overlayDrawText(fb, kOverlayX0 + kOverlayPanelW - 2 - overlayTextWidth(rightText), textY, rightText, textColor);
+	}
+
+	// Thin rainbow accent stripe along the top edge, echoing the badge
+	// stripe on the real case (below the "TK2000 color computer" logo).
+	// Inset a couple pixels from the cream panel's own left/right edges
+	// -- flush with the panel edge, the case's tapered top corners (see
+	// the bg fill above) clipped a sliver of the outer bands off past
+	// the keyboard outline, which is what this margin avoids.
+	{
+		const SRGB stripe[] = {
+			{ 200, 40, 40 }, { 224, 122, 30 }, { 224, 198, 40 }, { 60, 148, 72 }, { 42, 92, 188 },
+		};
+		constexpr int kBands = sizeof(stripe) / sizeof(stripe[0]);
+		constexpr int kStripeH = 2;
+		constexpr int kStripeInset = 3;
+		const int stripeX0 = kOverlayX0 - 2 + kStripeInset;
+		const int stripeW = kOverlayPanelW + 4 - 2 * kStripeInset;
+		const int bandW = stripeW / kBands;
+		for (int b = 0; b < kBands; b++) {
+			// Last band absorbs the remainder from the division above,
+			// so the bands' total width always lands exactly on
+			// stripeX0 + stripeW -- never past it.
+			const int w = (b == kBands - 1) ? (stripeW - bandW * (kBands - 1)) : bandW;
+			overlayFillRect(fb, stripeX0 + b * bandW, kOverlayY0 - 2, w, kStripeH, stripe[b]);
+		}
+	}
+
+	for (int r = 0; r < kOverlayRowCount; r++) {
+		const SOverlayRow& row = kOverlayRows[r];
+		// Total row width now varies per key (`units`), not just key
+		// count -- sum it up so shorter rows (SHIFT row, SPACE bar)
+		// still center within the panel, same as on the real keyboard.
+		int rowW = 0;
+		for (int c = 0; c < row.count; c++) {
+			rowW += row.keys[c].units * kOverlayCellW;
+		}
+		const int rowX0 = kOverlayX0 + (kOverlayPanelW - rowW) / 2;
+		int cx = rowX0;
+		for (int c = 0; c < row.count; c++) {
+			const SOverlayKey& key = row.keys[c];
+			const int cellW = key.units * kOverlayCellW;
+			const bool isSelected = (r == mOverlayRow && c == mOverlayCol);
+			const bool isLatchedOn = (key.isShift && mOverlayShiftLatched) || (key.isControl && mOverlayCtrlLatched);
+			const SRGB cellColor = isSelected ? selBg : (isLatchedOn ? keyBgShiftOn : keyBg);
+			const int cy = kOverlayY0 + r * kOverlayCellH;
+			const int kx = cx + 1, ky = cy + 1, kw = cellW - 2, kh = kOverlayCellH - 2;
+
+			// Keycap body, with a 1px bevel (light top/left, dark
+			// bottom/right) so keys read as raised caps rather than
+			// flat tiles, like the sculpted keys on the real unit.
+			overlayFillRect(fb, kx, ky, kw, kh, cellColor);
+			if (!isSelected) {
+				overlayFillRect(fb, kx, ky, kw, 1, keyEdgeHi);
+				overlayFillRect(fb, kx, ky, 1, kh, keyEdgeHi);
+				overlayFillRect(fb, kx, ky + kh - 1, kw, 1, keyEdgeLo);
+				overlayFillRect(fb, kx + kw - 1, ky, 1, kh, keyEdgeLo);
+			}
+
+			const SRGB gcolor = isSelected ? glyphOnSel : glyphOn;
+			if (key.label) {
+				// Multi-letter keycap (RESET, REPEAT, FIRE, CONTROL,
+				// SHIFT, RETURN, SPACE): center the text block in the cap.
+				const int tw = overlayTextWidth(key.label);
+				const int tx0 = cx + (cellW - tw) / 2;
+				const int ty0 = cy + (kOverlayCellH - 5) / 2;
+				overlayDrawText(fb, tx0, ty0, key.label, gcolor);
+				cx += cellW;
+				continue;
+			}
+
+			if (key.glyph == kGlyphUp || key.glyph == kGlyphDown ||
+				key.glyph == kGlyphLeft || key.glyph == kGlyphRight) {
+				const int dir = (key.glyph == kGlyphUp) ? 0 : (key.glyph == kGlyphDown) ? 1 :
+					(key.glyph == kGlyphLeft) ? 2 : 3;
+				const int bw = (dir < 2) ? 9 : 10;
+				const int bh = (dir < 2) ? 10 : 9;
+				overlayDrawArrow(fb, cx + (cellW - bw) / 2, cy + (kOverlayCellH - bh) / 2, dir, gcolor);
+				cx += cellW;
+				continue;
+			}
+
+			const byte* glyph7 = findGlyph5x7(key.glyph);
+			if (glyph7) {
+				const int scale = 2;
+				const int gx0 = cx + (cellW - 5 * scale) / 2;
+				const int gy0 = cy + (kOverlayCellH - 7 * scale) / 2;
+				for (int gy = 0; gy < 7; gy++) {
+					for (int gx = 0; gx < 5; gx++) {
+						if (glyph7[gy] & (1 << (4 - gx))) {
+							overlayFillRect(fb, gx0 + gx * scale, gy0 + gy * scale, scale, scale, gcolor);
+						}
+					}
+				}
+				cx += cellW;
+				continue;
+			}
+
+			const byte* glyphRows = findGlyph(key.glyph);
+			if (glyphRows) {
+				const int scale = 3;
+				const int gx0 = cx + (cellW - 3 * scale) / 2;
+				const int gy0 = cy + (kOverlayCellH - 5 * scale) / 2;
+				for (int gy = 0; gy < 5; gy++) {
+					for (int gx = 0; gx < 3; gx++) {
+						if (glyphRows[gy] & (1 << (2 - gx))) {
+							overlayFillRect(fb, gx0 + gx * scale, gy0 + gy * scale, scale, scale, gcolor);
+						}
+					}
+				}
+			}
+			cx += cellW;
+		}
+	}
+}
+
+/*************************************************************************************************/
+// --- Savestate layout ---
+// A fixed sequence of fixed-size POD blocks: CPU state, full 64KB RAM,
+// video/audio/keyboard/tape state. No versioning beyond the overall
+// size check — like most libretro cores, states are only expected to
+// be compatible within the same core build.
+namespace {
+	struct SHeader {
+		uint32_t magic;	// 'TK2K'
+		uint32_t version;
+	};
+	constexpr uint32_t kMagic = 0x4B325454;	// "TTK2" little-endian-ish tag
+	constexpr uint32_t kVersion = 3;	// bumped: added CLangCard::SState (64K/language card support) to the layout
+}
+
+size_t CMachine::stateSize() const {
+	return sizeof(SHeader)
+		+ sizeof(CCpu6502::SState)
+		+ 0x10000	// RAM
+		+ sizeof(CVideo::SState)
+		+ sizeof(CAudio::SState)
+		+ sizeof(CKeyboard::SState)
+		+ sizeof(CTape::SState)
+		+ sizeof(CJoystick::SState)
+		+ sizeof(CLangCard::SState);
+}
+
+bool CMachine::saveState(void* data, size_t size) const {
+	if (size < stateSize()) {
+		return false;
+	}
+	uint8_t* p = static_cast<uint8_t*>(data);
+
+	SHeader hdr{ kMagic, kVersion };
+	memcpy(p, &hdr, sizeof(hdr)); p += sizeof(hdr);
+
+	CCpu6502::SState cpuState = mCpu.saveState();
+	memcpy(p, &cpuState, sizeof(cpuState)); p += sizeof(cpuState);
+
+	memcpy(p, mRam.mRam, 0x10000); p += 0x10000;
+
+	CVideo::SState videoState = mVideo.saveState();
+	memcpy(p, &videoState, sizeof(videoState)); p += sizeof(videoState);
+
+	CAudio::SState audioState = mAudio.saveState();
+	memcpy(p, &audioState, sizeof(audioState)); p += sizeof(audioState);
+
+	CKeyboard::SState kbState = mKeyboard.saveState();
+	memcpy(p, &kbState, sizeof(kbState)); p += sizeof(kbState);
+
+	CTape::SState tapeState = mTape.saveState();
+	memcpy(p, &tapeState, sizeof(tapeState)); p += sizeof(tapeState);
+
+	CJoystick::SState joyState = mJoystick.saveState();
+	memcpy(p, &joyState, sizeof(joyState)); p += sizeof(joyState);
+
+	CLangCard::SState langCardState = mLangCard.saveState();
+	memcpy(p, &langCardState, sizeof(langCardState)); p += sizeof(langCardState);
+
+	return true;
+}
+
+bool CMachine::loadState(const void* data, size_t size) {
+	if (size < stateSize()) {
+		return false;
+	}
+	const uint8_t* p = static_cast<const uint8_t*>(data);
+
+	SHeader hdr{};
+	memcpy(&hdr, p, sizeof(hdr)); p += sizeof(hdr);
+	if (hdr.magic != kMagic || hdr.version != kVersion) {
+		return false;
+	}
+
+	CCpu6502::SState cpuState{};
+	memcpy(&cpuState, p, sizeof(cpuState)); p += sizeof(cpuState);
+	mCpu.loadState(cpuState);
+
+	memcpy(mRam.mRam, p, 0x10000); p += 0x10000;
+
+	CVideo::SState videoState{};
+	memcpy(&videoState, p, sizeof(videoState)); p += sizeof(videoState);
+	mVideo.loadState(videoState);
+
+	CAudio::SState audioState{};
+	memcpy(&audioState, p, sizeof(audioState)); p += sizeof(audioState);
+	mAudio.loadState(audioState);
+
+	CKeyboard::SState kbState{};
+	memcpy(&kbState, p, sizeof(kbState)); p += sizeof(kbState);
+	mKeyboard.loadState(kbState);
+
+	CTape::SState tapeState{};
+	memcpy(&tapeState, p, sizeof(tapeState)); p += sizeof(tapeState);
+	mTape.loadState(tapeState);
+
+	CJoystick::SState joyState{};
+	memcpy(&joyState, p, sizeof(joyState)); p += sizeof(joyState);
+	mJoystick.loadState(joyState);
+
+	CLangCard::SState langCardState{};
+	memcpy(&langCardState, p, sizeof(langCardState)); p += sizeof(langCardState);
+	mLangCard.loadState(langCardState);
+
+	return true;
+}

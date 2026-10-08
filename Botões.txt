@@ -1,0 +1,9 @@
+Botão	Função
+
+START	Liga/desliga o teclado virtual
+SELECT	Abre/fecha o seletor de fitas .ct2
+R	Cicla a velocidade da fita: Desligado, 4x, 8x, 16x, 32x
+L	Hard reset (limpa a RAM)
+L2 e R2	Play/Pause da fita; se a fita acabou, insere a próxima do playlist
+A / B	Fire / Fire 2 (sem mudança)
+X / Y	Livres

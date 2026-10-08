@@ -1,0 +1,147 @@
+--- /tmp/o/Machine.h	2026-09-28 13:34:18.000000000 +0000
++++ Machine.h	2026-09-28 23:51:25.981231377 +0000
+@@ -75,7 +75,7 @@
+ 	// cassette port as soon as content/tape starts playing.
+ 	// bootDelayFrames < 0 uses the cold-boot default (~1.5s); pass a small
+ 	// value when the machine is already up (e.g. answering "tecle espaco").
+-	void queueAutoType(const char* text, int bootDelayFrames = -1, bool playFirst = false);
++	void queueAutoType(const char* text, int bootDelayFrames = -1, bool playFirst = false, bool autoPlayAfter = true);
+ 
+ 	// Tape (.ct2)
+ 	// insertTape() also remembers whether the load succeeded, so the
+@@ -154,6 +154,8 @@
+ 	// com o jogo ja rodando); false: PLAY so depois do ultimo caractere
+ 	// (LOADT no BASIC).
+ 	bool mAutoPlayFirst{ false };
++	// false: nao aperta PLAY depois de digitar (ex.: CALL 34560 apos o fim da fita).
++	bool mAutoPlayAfter{ true };
+ 
+ 	// Set by insertTape(); tells updateAutoType() whether there's a tape
+ 	// worth auto-playing once "LOADT\n" is done being typed.
+--- /tmp/o/Machine.cpp	2026-09-28 13:34:16.000000000 +0000
++++ Machine.cpp	2026-09-28 23:51:25.981704376 +0000
+@@ -387,8 +387,9 @@
+ }
+ 
+ /*************************************************************************************************/
+-void CMachine::queueAutoType(const char* text, int bootDelayFrames, bool playFirst) {
++void CMachine::queueAutoType(const char* text, int bootDelayFrames, bool playFirst, bool autoPlayAfter) {
+ 	mAutoPlayFirst = playFirst;
++	mAutoPlayAfter = autoPlayAfter;
+ 	mAutoTypeText = text ? text : "";
+ 	mAutoTypeIndex = 0;
+ 	mAutoTypeState = EAutoTypeState::WaitBoot;
+@@ -416,7 +417,7 @@
+ 			// Finished typing (e.g. "LOADT\n"). If a tape was actually
+ 			// loaded, auto-press play a moment later instead of making
+ 			// the user reach for the RetroPad A button themselves.
+-			if (mTapeLoaded && !mAutoPlayFirst) {
++			if (mTapeLoaded && !mAutoPlayFirst && mAutoPlayAfter) {
+ 				mAutoTypeState = EAutoTypeState::WaitAutoPlay;
+ 				mAutoTypeTimer = kAutoPlayDelayFrames;
+ 			} else {
+--- /tmp/o/libretro.cpp	2026-09-28 17:07:52.000000000 +0000
++++ libretro.cpp	2026-09-28 23:52:56.628458563 +0000
+@@ -165,7 +165,14 @@
+ bool g_ejected = false;
+ unsigned g_initialImage = 0;
+ bool g_tapeWasPlaying = false;
+-bool g_tapeEnded = false;	// tape ran to its end since it was (re)inserted
++bool g_tapeEnded = false;
++// Auto "CALL 34560": depois que a fita inicial (LOADT) termina de carregar,
++// digita CALL 34560 + RETURN sozinho (endereco de entrada de jogos como HEAD ON).
++// Controlado pela opcao tk2000_auto_call; vale SOMENTE p/ "Desafio Fatal".
++bool g_autoCallEnabled = true;
++bool g_autoCallPending = false;
++constexpr int kAutoCallDelayFrames = 90;	// ~1.5s apos o fim da fita, p/ a ROM voltar ao prompt
++	// tape ran to its end since it was (re)inserted
+ 
+ std::string baseName(const std::string& path) {
+ 	const size_t pos = path.find_last_of("/\\");
+@@ -244,6 +251,7 @@
+ 		return false;
+ 	}
+ 	g_tapeEnded = false;
++	g_autoCallPending = false;
+ 	g_tapeWasPlaying = false;
+ 	static char buf[512];
+ 	snprintf(buf, sizeof(buf), autoStart ? "Fita %u/%u: %s - carregando..."
+@@ -420,6 +428,17 @@
+ // for the in-game R-button cycle -- not polled every frame, so pressing
+ // R during play isn't immediately stomped back to whatever the menu
+ // still says.
++void apply_auto_call_option() {
++	g_autoCallEnabled = true;
++	if (!g_environ_cb) {
++		return;
++	}
++	struct retro_variable var { "tk2000_auto_call", nullptr };
++	if (g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
++		g_autoCallEnabled = (strcmp(var.value, "disabled") != 0);
++	}
++}
++
+ void apply_initial_fast_tape_option() {
+ 	if (!g_environ_cb) {
+ 		return;
+@@ -557,6 +576,7 @@
+ 	cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void*)descs);
+ 
+ 	static const struct retro_variable vars[] = {
++		{ "tk2000_auto_call", "Desafio Fatal: digitar CALL 34560 apos carregar a fita; enabled|disabled" },
+ 		{ "tk2000_fast_tape_load", "Carregamento rapido de fita (inicial; use R no jogo p/ trocar); 16x|disabled|4x|8x|32x" },
+ 		{ nullptr, nullptr },
+ 	};
+@@ -693,6 +713,22 @@
+ 	return name.find("karateka") != std::string::npos;
+ }
+ 
++// true so p/ "Desafio Fatal.ct2" (ou .zip com esse nome): ignora maiusculas,
++// espacos, "_" e "-" no nome do arquivo.
++bool current_tape_is_desafio_fatal() {
++	if (g_images.empty() || g_imageIndex >= g_images.size()) {
++		return false;
++	}
++	const std::string raw = baseName(g_images[g_imageIndex]);
++	std::string name;
++	for (char c : raw) {
++		if (std::isalnum((unsigned char)c)) {
++			name += (char)std::tolower((unsigned char)c);
++		}
++	}
++	return name.find("desafiofatal") != std::string::npos;
++}
++
+ void release_karateka_keys() {
+ 	for (int i = 0; i < kKaratekaKeyCount; i++) {
+ 		if (g_karatekaDown[i]) {
+@@ -877,6 +913,12 @@
+ 		const bool playing = g_machine->tapePlaying();
+ 		if (g_tapeWasPlaying && !playing) {
+ 			g_tapeEnded = true;
++			if (g_autoCallPending) {
++				g_autoCallPending = false;
++				if (current_tape_is_desafio_fatal()) {
++					g_machine->queueAutoType("CALL 34560\n", kAutoCallDelayFrames, false, false);
++				}
++			}
+ 		}
+ 		g_tapeWasPlaying = playing;
+ 	}
+@@ -936,6 +978,7 @@
+ 	g_imageIndex = 0;
+ 	g_ejected = false;
+ 	g_tapeEnded = false;
++	g_autoCallPending = false;
+ 	g_tapeWasPlaying = false;
+ 	const char* loadPath = (game && game->path) ? game->path : nullptr;
+ 	if (loadPath && hasExtension(loadPath, "m3u")) {
+@@ -1022,6 +1065,8 @@
+ 		// was loaded), so no button press is needed. RetroPad A still works
+ 		// as a manual play/pause toggle afterwards.
+ 		g_machine->queueAutoType("LOADT\n");
++		apply_auto_call_option();
++		g_autoCallPending = g_autoCallEnabled;
+ 	}
+ 
+ 	apply_initial_fast_tape_option();

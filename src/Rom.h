@@ -1,0 +1,41 @@
+// Copyright (c) 2024 FBLabs
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+#pragma once
+
+#include "Common.h"
+#include "Device.h"
+#include "Bus.h"
+
+// Besides the 16KB ROM image, this device models the TK2000 behaviour used by
+// the Karateka loader's "interface" test: while annunciator AN1 is ON
+// ($C05B), $C100-$CFFF is RAM (read/write) instead of ROM; AN1 OFF ($C05A)
+// brings the ROM back. The loader turns AN1 on, writes $CC to $C150, reads it
+// back and turns AN1 off; if the byte does not stick it assumes an expansion
+// interface is plugged in and prints "RETIRE SUA INTERFACE.".
+class CRom final : public CDevice {
+public:
+	CRom(CBus& bus);
+	byte read(const word addr, const uint64_t cycles) override;
+	void write(const word addr, const byte data, const uint64_t cycles) override;
+	void update(const uint64_t cycles) override {}
+	void reset() override;
+	// AN1 state: true = RAM banked over $C100-$FFFF ($C05B), false = ROM ($C05A)
+	bool isAn1() const { return mAn1; }
+private:
+	bool mAn1{ false };
+	byte mSlotRam[0x0F00]{};	// RAM that replaces $C100-$CFFF while AN1 is on
+};

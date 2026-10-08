@@ -1,0 +1,210 @@
+// Copyright (c) 2024 FBLabs
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+#include "pch.h"
+#include "Tape.h"
+#include "CoreLog.h"
+
+#define CT2_MAGIC "CTK2"
+#define CT2_CAB_A "CA"
+#define CT2_CAB_B "CB"
+#define CT2_DATA  "DA"
+
+#pragma pack(push, 1)
+struct SCh {
+	byte ID[2];
+	word size;
+};
+#pragma pack(pop)
+
+/*************************************************************************************************/
+CTape::CTape(CBus& bus, CCpu6502& cpu) :
+	mCpu(cpu),
+	mCyclesNeeded(0)
+{
+	bus.addDevice(EDevices::TAPE, this);
+	bus.registerAddr(EDevices::TAPE, 0xC010, 0xC02F);
+	bus.registerAddr(EDevices::TAPE, 0xC052, 0xC053);
+	bus.registerAddr(EDevices::TAPE, 0xC056, 0xC057);
+	mQueueIt = mQueueCycles.end();
+}
+
+/*************************************************************************************************/
+byte CTape::read(const word addr, const uint64_t cycles) {
+	if ((addr & 0xF0) == 0x10) {
+		if (!mPlay) {
+			return 0x00;
+		}
+		const unsigned long long actualCycle = mCpu.getCumulativeCycles();
+		if (mStartCycle == 0 && mQueueIt != mQueueCycles.end()) {
+			mStartCycle = actualCycle;
+			mCyclesNeeded = *(mQueueIt++);
+		}
+		if (actualCycle - mStartCycle > mCyclesNeeded) {
+			mStartCycle = actualCycle;
+			mCasOut ^= 0x80;
+			if (mQueueIt != mQueueCycles.end()) {
+				// TEMP INSTRUMENTATION (2026-09-27): the game can abort a
+				// bad load without ever calling stop() or draining the
+				// queue -- it just stops polling $C010-$C02F, which leaves
+				// no trace in the existing logs (an1/kbd go quiet, no
+				// JAM, no "end of queue"). Logging the pulse index every
+				// ~31 bytes (500 half-period entries) means the LAST line
+				// before things go silent tells us exactly which byte of
+				// which chunk (leader/CAB_B/data) the load got to.
+				static ptrdiff_t lastLoggedIdx = -1;
+				const ptrdiff_t idx = mQueueIt - mQueueCycles.begin();
+				if (idx < lastLoggedIdx || idx - lastLoggedIdx >= 500) {
+					tk2000_log("tape pulse %td/%zu cycles=%llu",
+						idx, mQueueCycles.size(), (unsigned long long)actualCycle);
+					lastLoggedIdx = idx;
+				}
+				mCyclesNeeded = *(mQueueIt++);
+			} else {
+				mStartCycle = 0;
+				mPlay = false;
+				mCpu.setFullSpeed(false);
+				tk2000_log("tape reached end of queue (%zu pulses) at cycle %llu",
+					mQueueCycles.size(), (unsigned long long)actualCycle);
+			}
+		}
+	}
+
+	return mCasOut;
+}
+
+/*************************************************************************************************/
+void CTape::reset() {
+	mPlay = false;
+	mStartCycle = 0;
+}
+
+/*************************************************************************************************/
+void CTape::play() noexcept {
+	if (mQueueIt != mQueueCycles.end()) {
+		mPlay = true;
+		mCpu.setFullSpeed(true);
+		tk2000_log("tape play() at pulse %td/%zu",
+			mQueueIt - mQueueCycles.begin(), mQueueCycles.size());
+	}
+}
+
+/*************************************************************************************************/
+void CTape::stop() noexcept {
+	if (mPlay) {
+		mPlay = false;
+		mQueueIt = mQueueCycles.end();
+	}
+}
+
+/*************************************************************************************************/
+void CTape::rewind() noexcept {
+	mQueueIt = mQueueCycles.begin();
+}
+
+/*************************************************************************************************/
+bool CTape::getPlayState() const noexcept {
+	return mPlay;
+}
+
+/*************************************************************************************************/
+bool CTape::insertCt2(const char *fileName) {
+	FILE *fileTape = fopen(fileName, "rb");
+	if (!fileTape) {
+		return false;
+	}
+	std::vector<byte> data;
+	byte chunk[4096];
+	size_t got;
+	while ((got = fread(chunk, 1, sizeof(chunk), fileTape)) > 0) {
+		data.insert(data.end(), chunk, chunk + got);
+	}
+	fclose(fileTape);
+	return insertCt2Data(data.data(), data.size());
+}
+
+/*************************************************************************************************/
+// Same parsing as the original file-based loader, just over a memory
+// buffer (so a tape can also come out of a .zip).
+bool CTape::insertCt2Data(const byte* data, size_t size) {
+	if (size < sizeof(dword) || memcmp(data, CT2_MAGIC, sizeof(dword)) != 0) {
+		return false;
+	}
+	size_t pos = sizeof(dword);
+	mQueueCycles.clear();
+	SCh ch;
+	while (pos + sizeof(SCh) <= size) {
+		memcpy(&ch, data + pos, sizeof(SCh));
+		pos += sizeof(SCh);
+		if (memcmp(ch.ID, CT2_CAB_A, sizeof(word)) == 0) {
+			for (int i = 0; i < 500; i++) {
+				mQueueCycles.emplace_back(500);
+				mQueueCycles.emplace_back(500);
+			}
+		} else if (memcmp(ch.ID, CT2_CAB_B, sizeof(word)) == 0) {
+			mQueueCycles.emplace_back(464);
+			mQueueCycles.emplace_back(679);
+			for (int i = 0; i < 32; i++) {
+				mQueueCycles.emplace_back(679);
+				mQueueCycles.emplace_back(679);
+			}
+			mQueueCycles.emplace_back(199);
+			mQueueCycles.emplace_back(250);
+		} else if (memcmp(ch.ID, CT2_DATA, sizeof(word)) == 0) {
+			for (int i = 0; i < ch.size && pos < size; i++) {
+				const byte b = data[pos++];
+				for (int j = 0; j < 8; j++) {
+					int mask = 1 << (7 - j);
+					if ((mask & b) == mask) {
+						// 1
+						mQueueCycles.emplace_back(500);
+						mQueueCycles.emplace_back(500);
+					} else {
+						// 0
+						mQueueCycles.emplace_back(250);
+						mQueueCycles.emplace_back(250);
+					}
+				}
+			}
+		}
+	}
+	mQueueIt = mQueueCycles.begin();	// Update iterator
+	// A freshly inserted cassette starts stopped and at its beginning,
+	// even if the previous one was still "playing" when it was swapped.
+	mPlay = false;
+	mStartCycle = 0;
+	return true;
+}
+
+/*************************************************************************************************/
+CTape::SState CTape::saveState() const {
+	SState s{};
+	s.startCycle = mStartCycle;
+	s.queuePos = (mQueueIt == mQueueCycles.end()) ? -1 : (mQueueIt - mQueueCycles.begin());
+	s.cyclesNeeded = mCyclesNeeded;
+	s.casOut = mCasOut;
+	s.play = mPlay;
+	return s;
+}
+
+/*************************************************************************************************/
+void CTape::loadState(const SState& s) {
+	mStartCycle = s.startCycle;
+	mQueueIt = (s.queuePos < 0) ? mQueueCycles.end() : (mQueueCycles.begin() + s.queuePos);
+	mCyclesNeeded = s.cyclesNeeded;
+	mCasOut = s.casOut;
+	mPlay = s.play;
+}

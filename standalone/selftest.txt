@@ -1,0 +1,10 @@
+quadros rodados .......... 180
+chamadas de video ....... 180
+soma dos pixels ......... 221485088
+chamadas de audio ....... 180  (132296 quadros)
+input_poll .............. 180
+input_state ............. 2520
+teclado down/up ......... 1 / 1
+callback de teclado ..... registrado
+DIB ..................... 280x192
+relatorio em ............ G:\Internet_Temp\Batocera_add\tk2000\standalone\selftest.txt

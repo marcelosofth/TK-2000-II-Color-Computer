@@ -1,0 +1,49 @@
+=====================================================================================
+USE WITH JOYSTICK Padrão PC/XBOX:
+=====================================================================================
+
+MAPEAMENTO GERAL:
+D-pad ←	= Esquerda
+D-pad →	= Direita
+D-pad ↓	= Posição de Luta
+D-pad ↑	= Comprimentar 
+Botão X  = Créditos
+Botão A  = Botão 1
+Botão B  = Botão 2
+Botão START = Teclado
+Botão SELECT = Escolher Disco 2
+Botão L1 = Reset
+Botão R1 = Acelerar carregamento
+Botão L2 = Play / Pause da fita
+Botão R2 = Play / Pause da fita
+
+MAPEAMENTO ESPECIAL (KARATEKA)
+D-pad ←	= Esquerda
+D-pad →	= Direita
+D-pad ↓	= Posição de Luta
+D-pad ↑	= Comprimentar 
+Botão X	= Soco baixo
+Botão Y	= Soco alto
+Botão A	= Chute baixp
+Botão B	= Chute alto
+Botão L	= Soco médio
+Botão R	= Chute médio
+Botão START = Teclado virtual
+Botão SELECT = Escolher Disco 2
+Botão L2 = Acelerar carregamento
+Botão R2 = Créditos
+
+=====================================================================================
+
+O TK2000, produzido pela empresa brasileira Microdigital Eletrônica Ltda,
+foi um microcomputador apresentado ao público durante a Feira de Informática
+de 1983 e lançado em 1984. Utilizava a CPU 6502 e era na verdade um clone do
+taiwanês Micro-Professor MPF-II fabricado pela Multitech (antecessora da Acer).
+Era parcialmente compatível com o software e hardware do Apple II+. Em 1985,
+foi lançada uma versão aperfeiçoada (com opção de 128K), o TK2000 II. Em 1987,
+foi descontinuado.
+
+=====================================================================================
+by Marcelo Tavares
+marcelosofth@gmail.com (2026)
+=====================================================================================

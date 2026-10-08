@@ -1,0 +1,174 @@
+// Copyright (c) 2024 FBLabs
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+//
+// --- libretro port note ---
+// This replaces the original Machine.h/.cpp, which owned an SDL window,
+// an SDL audio device, a CPU worker thread and an on-screen menu system.
+// None of that has a place inside a libretro core: the frontend owns the
+// window, the audio device and the event loop, and calls into the core
+// once per frame via retro_run(). CMachine here is reduced to exactly
+// what the frame callback needs: advance the CPU by one frame's worth of
+// cycles, collect whatever audio samples were produced, and hand back
+// the finished video frame buffer. Everything below it (CBus, CCpu6502,
+// CRom, CRam, CVideo, CAudio, CKeyboard, CTape) is untouched emulation
+// logic ported as-is from the original project.
+
+#pragma once
+
+#include <string>
+#include "Common.h"
+#include "Bus.h"
+#include "Cpu6502.h"
+#include "Video.h"
+#include "Ram.h"
+#include "Rom.h"
+#include "LangCard.h"
+#include "Audio.h"
+#include "Keyboard.h"
+#include "Tape.h"
+#include "Disk.h"
+#include "Joystick.h"
+#include "Observer.h"
+
+/*************************************************************************************************/
+class CMachine final : public CObserver<sAudioMsg> {
+public:
+	CMachine();
+	// CObserver<sAudioMsg> — called synchronously from CAudio::update(),
+	// itself called from mBus.updateAll() inside runFrame().
+	void notify(sAudioMsg&) override;
+
+	// Frame-oriented API used by libretro.cpp
+	void runFrame(unsigned long cyclesPerFrame);
+	SRGB* getFrameBuffer();
+	// Mono samples produced during the last runFrame() call. Valid until
+	// the next runFrame() (which clears and refills the accumulator) —
+	// read it right after runFrame(), same as getFrameBuffer().
+	const int16_t* takeAudioSamples(size_t& count);
+
+	// Machine control
+	void softReset();	// equivalent to the original F5 / "Soft Reset"
+	void hardReset();	// equivalent to the original "Hard reset" (clears RAM too)
+
+	// Input
+	void keyEvent(bool down, unsigned keycode, uint16_t mod);
+
+	// Auto-type: schedules `text` (letters/digits/space; use '\n' for
+	// RETURN) to be "typed" into the keyboard matrix a short while after
+	// boot, one synthetic key press per few frames — used to auto-run a
+	// command like "LOADT\n" so the machine is already waiting on the
+	// cassette port as soon as content/tape starts playing.
+	// bootDelayFrames < 0 uses the cold-boot default (~1.5s); pass a small
+	// value when the machine is already up (e.g. answering "tecle espaco").
+	void queueAutoType(const char* text, int bootDelayFrames = -1);
+
+	// Tape (.ct2)
+	// insertTape() also remembers whether the load succeeded, so the
+	// auto-type state machine knows whether it's safe to auto-press play
+	// once "LOADT\n" has finished being typed (see updateAutoType()).
+	bool insertTape(const char* fileName);
+	bool insertTapeData(const byte* data, size_t size);	// .ct2 already in memory (e.g. from a .zip)
+	void tapePlay();
+	void tapeRewind();
+	bool tapePlaying() const;
+
+	// Disk (.dsk, 35x16x256 DOS order). On success this also boots
+	// straight off the disk (see bootFromDisk()) -- call it right after
+	// hardReset(), the same way insertTape() is meant to be used.
+	bool insertDisk(const char* fileName);
+
+	// Native joystick/paddle port ($C061-$C07F). Only meaningful while
+	// the on-screen keyboard overlay below is closed -- libretro.cpp
+	// routes D-pad/fire-button input to one or the other, never both.
+	void padEvent(bool left, bool right, bool up, bool down, bool button0, bool button1);
+
+	// On-screen keyboard overlay, for setups with no physical keyboard
+	// (paired with padEvent() above for gameplay). Toggled by a RetroPad
+	// button; while open, the D-pad navigates a key grid drawn directly
+	// into the video frame and one more button "presses" the highlighted
+	// key via the same CKeyboard::keyEvent() path a real key would use.
+	void toggleKeyboardOverlay();
+	bool isKeyboardOverlayActive() const { return mOverlayActive; }
+	// left/right/up/down/select should already be edge-detected by the
+	// caller (one grid step or key press per button press, no repeat).
+	void overlayNavigate(bool left, bool right, bool up, bool down, bool select);
+
+	// Savestate support
+	size_t stateSize() const;
+	bool saveState(void* data, size_t size) const;
+	bool loadState(const void* data, size_t size);
+
+	// Raw RAM access (retro_get_memory_data/size — cheats, RetroAchievements, etc.)
+	byte* getRamPtr() { return mRam.mRam; }
+	size_t getRamSize() const { return 0x10000; }
+
+private:
+	void updateAutoType();
+	void updateOverlayTap();
+	// Hand-loads Boot0+Boot1 into RAM at $0800 and jumps to $0801, the
+	// same end state a real Disk ][ boot ROM leaves behind -- see Disk.h
+	// and Disk.cpp's header comment for why this is done directly in C++
+	// instead of emulating a $C600 boot ROM. Called once by insertDisk()
+	// right after a successful load; assumes hardReset() already ran.
+	void bootFromDisk();
+	void drawKeyboardOverlay(SRGB* fb);
+
+	CBus mBus{};
+	CCpu6502 mCpu{ mBus };
+	CRom mRom{ mBus };
+	CLangCard mLangCard{ mBus, mRom };
+	CRam mRam{ mBus };
+	CVideo mVideo{ mBus, mRam.mRam };
+	CAudio mAudio{ mBus, mCpu };
+	CKeyboard mKeyboard{ mBus };
+	CTape mTape{ mBus, mCpu };
+	CJoystick mJoystick{ mBus };
+	CDisk mDisk{ mBus };
+
+	std::vector<int16_t> mAudioAccum;
+
+	// Auto-type state machine (see queueAutoType()). WaitAutoPlay is a
+	// short pause after the last key ('\n') of the typed text before the
+	// tape is auto-started, entered only when mTapeLoaded is true.
+	enum class EAutoTypeState { Idle, WaitBoot, KeyDown, KeyUp, WaitAutoPlay };
+	std::string mAutoTypeText;
+	size_t mAutoTypeIndex{ 0 };
+	EAutoTypeState mAutoTypeState{ EAutoTypeState::Idle };
+	int mAutoTypeTimer{ 0 };
+
+	// Set by insertTape(); tells updateAutoType() whether there's a tape
+	// worth auto-playing once "LOADT\n" is done being typed.
+	bool mTapeLoaded{ false };
+
+	// On-screen keyboard overlay state (see toggleKeyboardOverlay() /
+	// overlayNavigate()). mOverlayShiftLatched behaves like a caps-lock
+	// toggle rather than a held key, since there's no physical shift to
+	// hold down while navigating with a D-pad.
+	bool mOverlayActive{ false };
+	int mOverlayRow{ 0 };
+	int mOverlayCol{ 0 };
+	bool mOverlayShiftLatched{ false };
+	// Same idea, for the CONTROL key -- toggled on/off by
+	// overlayNavigate() and mirrored straight into CKeyboard's mCtrl
+	// via a real RETROK_LCTRL keyEvent() (see overlayNavigate()).
+	bool mOverlayCtrlLatched{ false };
+	// Holds a virtual key down for a few frames after overlayNavigate()
+	// "presses" it, same reasoning as the auto-type state machine above
+	// -- the ROM's input routine expects a key to stay down at least a
+	// frame or two, not a single instantaneous pulse.
+	int mOverlayTapTimer{ 0 };
+	unsigned mOverlayTapKeycode{ 0 };
+};
