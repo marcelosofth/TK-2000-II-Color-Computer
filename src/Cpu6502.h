@@ -18,8 +18,32 @@
 
 #include "Common.h"
 #include "Bus.h"
+#include <cstdio>
+#include <cstdarg>
 
 /* Typedefs */
+
+// --- Temporary debug hook: shape-pointer trace (karateka-remaster) -------
+// Self-contained on purpose (own file, own FILE*) rather than reusing
+// libretro.cpp's tk2000_log, which has internal (anonymous-namespace)
+// linkage and isn't visible from this translation unit. `inline` here
+// means the function (and its function-local static FILE*) is merged
+// across every .cpp that includes this header, so all callers share the
+// same open log file instead of each getting their own. Writes
+// karateka_shapes.log next to the core, flushing every line so the file
+// is readable even if the process is killed instead of closed cleanly.
+inline void tk2000_shapelog(const char* fmt, ...) {
+	static FILE* f = fopen("karateka_shapes.log", "a");
+	if (!f) {
+		return;
+	}
+	va_list args;
+	va_start(args, fmt);
+	vfprintf(f, fmt, args);
+	va_end(args);
+	fputc('\n', f);
+	fflush(f);
+}
 
 union UReg16bit {
 	struct {
@@ -114,7 +138,35 @@ private:
 		} else if (mDbgArmed && !mDbgTripped && address >= 0xC001 && address <= 0xC00F) {
 			dbgOnWrite(address, value);
 		}
+		// --- Temporary debug hook: shape-pointer trace (karateka-remaster) ---
+		// Every draw call sets up zero page $03/$04 (shape data pointer) just
+		// before jumping into the blit dispatch table, always writing $03
+		// (low byte) first and $04 (high byte) second -- confirmed by static
+		// disassembly of every call site found so far. So catching the
+		// write to $04 here, after $03 is already in RAM, gives the
+		// complete pointer with no risk of catching it half-written.
+		// Logs cycle count (for ordering/correlating with on-screen
+		// action), the approximate PC of the STA $04 that triggered this
+		// (STA zp is a 2-byte instruction, so the instruction itself
+		// started 2 bytes before the current PC), the resulting pointer,
+		// and the other zero-page fields the draw routines are known to
+		// read ($05 row, $06/$07 page base, $0E column, $0F flip, $10
+		// sub-pixel offset). Safe to leave in: read-only peeks plus one
+		// buffered log line, no behavior change.
+		if (address == 0x04) {
+			dbgLogShapePointer(value);
+		}
 		mBus.writeByte(address, value, mCumulativeCycles);
+	}
+
+	void dbgLogShapePointer(byte hiByte) const {
+		byte lo = dbgPeek(0x03);
+		word ptr = (word)((hiByte << 8) | lo);
+		byte r05 = dbgPeek(0x05), r06 = dbgPeek(0x06), r07 = dbgPeek(0x07);
+		byte r0E = dbgPeek(0x0E), r0F = dbgPeek(0x0F), r10 = dbgPeek(0x10);
+		word approxPC = (word)(mRegPC.value - 2);
+		tk2000_shapelog("cyc=%llu pc=$%04X ptr=$%04X row=$%02X base=$%02X,$%02X col=$%02X flip=$%02X sub=$%02X",
+			(unsigned long long)mCumulativeCycles, approxPC, ptr, r05, r06, r07, r0E, r0F, r10);
 	}
 
 	inline void writeWord(word address, word value) const {

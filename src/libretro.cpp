@@ -16,11 +16,13 @@
 #include "HostPaths.h"
 #include "ZipTape.h"
 #include "CoreLog.h"
+#include "intro_castle.h"
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <ctime>
 
 #include <string>
 #include <vector>
@@ -137,6 +139,106 @@ int g_fastTapeMultiplier = kFastTapeSpeeds[kFastTapeDefaultIndex];
 CMachine* g_machine = nullptr;
 std::vector<uint32_t> g_videoBuf;
 
+// --- Tela "LIGUE O GRAVADOR E TECLE ESPACO." do Karateka ---
+// Quando o jogo pede o proximo lado da fita ele desenha so' esse texto sobre
+// fundo preto. Aqui reconhecemos essa tela pelo formato do texto (assinatura
+// kPromptSig, em intro_castle.h) e, enquanto ela estiver no ar, mostramos a
+// imagem do castelo no lugar. Nada na maquina emulada e' alterado: e' so' o
+// quadro de video que sai do core. Qualquer outra tela segue normal.
+void castle_logf(const char* fmt, ...);	// definida depois de g_log_cb
+std::vector<SRGB> g_castle;
+bool g_castleTried = false;
+bool g_castleEnabled = true;
+
+void load_castle() {
+	g_castleTried = true;
+	static const char kAlpha[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	signed char tab[256];
+	for (int i = 0; i < 256; i++) tab[i] = -1;
+	for (int i = 0; i < 64; i++) tab[(unsigned char)kAlpha[i]] = (signed char)i;
+	std::vector<unsigned char> raw;
+	raw.reserve(INTRO_CASTLE_W * INTRO_CASTLE_H_ * 3);
+	unsigned acc = 0;
+	int bits = 0;
+	for (const char* p = intro_castle_b64; *p; p++) {
+		const signed char v = tab[(unsigned char)*p];
+		if (v < 0) continue;
+		acc = (acc << 6) | (unsigned)v;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			raw.push_back((unsigned char)((acc >> bits) & 0xFF));
+		}
+	}
+	if (raw.size() < (size_t)INTRO_CASTLE_W * INTRO_CASTLE_H_ * 3) {
+		castle_logf("castle: imagem corrompida (%d de %d bytes)", (int)raw.size(), INTRO_CASTLE_W * INTRO_CASTLE_H_ * 3);
+		return;	// dado corrompido: deixa g_castle vazio e o recurso fica desligado
+	}
+	g_castle.resize((size_t)INTRO_CASTLE_W * INTRO_CASTLE_H_);
+	for (size_t i = 0; i < g_castle.size(); i++) {
+		g_castle[i].red = raw[i * 3];
+		g_castle[i].green = raw[i * 3 + 1];
+		g_castle[i].blue = raw[i * 3 + 2];
+	}
+}
+
+// Pixel "aceso" = qualquer canal acima de um limiar baixo.
+inline bool castle_lit(const SRGB& p) {
+	return p.red > 40 || p.green > 40 || p.blue > 40;
+}
+
+// true se o quadro e' a tela preta com o texto do pedido de fita.
+// Geometria real (medida no dump de RAM da pagina HGR 1): ~790 pixels acesos,
+// todos nas linhas 99..110, da coluna ~1 ate ~272 (a frase ocupa a largura toda).
+// Reconhece pelo formato: uma unica faixa fina e larga. Telas com texto mais
+// curto (ex. "RETIRE SUA INTERFACE") e telas cheias ficam de fora.
+// Diagnostico: as linhas "castle:" vao para o tk2000_debug.log.
+bool is_tape_prompt_screen(const SRGB* fb) {
+	static int dbgTick = 0, dbgLogs = 0;
+	const bool dbgNow = ((dbgTick++ % 60) == 0) && (dbgLogs < 400);
+	if (dbgNow) dbgLogs++;
+
+	int lit = 0, minX = 9999, maxX = -1, minY = 9999, maxY = -1;
+	for (int y = 0; y < VIDEOHEIGHT; y++) {
+		for (int x = 0; x < VIDEOWIDTH; x++) {
+			if (!castle_lit(fb[y * VIDEOWIDTH + x])) continue;
+			if (++lit > 2500) {
+				if (dbgNow) castle_logf("castle: acesos > 2500 -> nao e' o pedido");
+				return false;
+			}
+			if (x < minX) minX = x;
+			if (x > maxX) maxX = x;
+			if (y < minY) minY = y;
+			if (y > maxY) maxY = y;
+		}
+	}
+	const int bw = maxX - minX + 1, bh = maxY - minY + 1;
+	const bool ok = lit >= 350 && maxX >= 0 &&
+		bw >= 235 && bh >= 8 && bh <= 22 &&
+		minY >= 90 && maxY <= 122 &&
+		minX <= 24 && maxX >= 255;
+	if (dbgNow) {
+		castle_logf("castle: acesos=%d caixa=%dx%d em (%d,%d) -> %s",
+			lit, maxX >= 0 ? bw : 0, maxX >= 0 ? bh : 0, minX, minY, ok ? "CASTELO" : "nao reconhecido");
+	}
+	return ok;
+}
+
+// Troca o quadro pelo castelo quando a tela do pedido de fita esta no ar.
+// TK2000_CASTLE_FORCE=1 mostra o castelo sempre (teste de que a imagem carrega).
+void apply_castle_screen(SRGB* fb) {
+	if (!g_castleEnabled) return;
+	if (!g_castleTried) load_castle();
+	if (g_castle.empty()) {
+		static bool warned = false;
+		if (!warned) { warned = true; castle_logf("castle: imagem NAO carregou (base64 corrompido?)"); }
+		return;
+	}
+	static const bool force = getenv("TK2000_CASTLE_FORCE") != nullptr;
+	if (!force && !is_tape_prompt_screen(fb)) return;
+	std::copy(g_castle.begin(), g_castle.end(), fb);
+}
+
 retro_environment_t g_environ_cb = nullptr;
 retro_video_refresh_t g_video_cb = nullptr;
 retro_audio_sample_batch_t g_audio_batch_cb = nullptr;
@@ -155,6 +257,15 @@ retro_input_poll_t g_input_poll_cb = nullptr;
 #endif
 retro_input_state_t g_input_state_cb = nullptr;
 retro_log_printf_t g_log_cb = nullptr;
+
+void castle_logf(const char* fmt, ...) {
+	char buf[256];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	tk2000_log("%s", buf);	// vai para o tk2000_debug.log (e para o log do RetroArch)
+}
 
 void show_message(const char* msg) {
 	if (!g_environ_cb) {
@@ -567,7 +678,53 @@ bool g_prevDown = false;
 bool g_prevLeft = false;
 bool g_prevRight = false;
 
+// --- Temporary debug hook: full RAM dump on F12 -----------------------------
+// Added to reverse-engineer Karateka's sprite/animation data (see the
+// karateka-remaster project). Writes the full 64KB system RAM
+// (g_machine->getRamPtr()/getRamSize(), the same buffer exposed to the
+// frontend via retro_get_memory_data) to a file next to the core, every time
+// F12 is pressed. Each press writes a new numbered file so multiple poses/
+// frames can be captured in one play session without overwriting each other.
+// Safe to leave in: F12 is not part of the TK2000 keyboard matrix mapping
+// used in-game (see kKeyMap / kKaratekaKeys above), so it never reaches
+// g_machine->keyEvent() and can't trigger any in-game key by accident.
+void dump_ram_snapshot() {
+	if (!g_machine) {
+		tk2000_log("F12 dump: g_machine is null, nothing to dump");
+		return;
+	}
+	// Use a wall-clock timestamp instead of an in-memory counter: the counter
+	// was found to reset to 0 every time RetroArch reloads the core (e.g. on
+	// restart), which silently overwrote karateka_ramdump_001.bin on every
+	// session instead of creating _002, _003, etc. The timestamp is unique
+	// across restarts, so every capture gets its own file.
+	time_t now = time(nullptr);
+	struct tm* lt = localtime(&now);
+	char path[64];
+	snprintf(path, sizeof(path), "karateka_ramdump_%02d%02d%02d_%02d%02d%02d.bin",
+		lt->tm_year % 100, lt->tm_mon + 1, lt->tm_mday,
+		lt->tm_hour, lt->tm_min, lt->tm_sec);
+	FILE* f = fopen(path, "wb");
+	if (!f) {
+		tk2000_log("F12 dump: failed to open %s for writing", path);
+		return;
+	}
+	const void* ram = g_machine->getRamPtr();
+	const size_t size = g_machine->getRamSize();
+	const size_t written = fwrite(ram, 1, size, f);
+	fclose(f);
+	tk2000_log("F12 dump: wrote %zu/%zu bytes to %s", written, size, path);
+	show_message("RAM dump salvo");
+}
+
 void RETRO_CALLCONV core_keyboard_event(bool down, unsigned keycode, uint32_t /*character*/, uint16_t key_modifiers) {
+	if (keycode == RETROK_F12) {
+		// Edge-triggered: only on key-down, not on the release event.
+		if (down) {
+			dump_ram_snapshot();
+		}
+		return;	// never forward F12 into the emulated keyboard matrix
+	}
 	if (g_machine) {
 		g_machine->keyEvent(down, keycode, key_modifiers);
 	}
@@ -1213,6 +1370,7 @@ void retro_run(void) {
 
 	// --- Video ---
 	SRGB* fb = g_machine->getFrameBuffer();
+	apply_castle_screen(fb);	// tela "Ligue o gravador..." -> castelo
 	g_picker.draw(fb);	// tape picker window (no-op while closed)
 	g_credits.draw(fb);	// credits window (no-op while closed)
 	for (int i = 0; i < VIDEOWIDTH * VIDEOHEIGHT; i++) {
@@ -1275,6 +1433,7 @@ void retro_cheat_set(unsigned, bool, const char*) {}
 
 /*************************************************************************************************/
 bool retro_load_game(const struct retro_game_info* game) {
+	castle_logf("build castelo v2 carregado: quadro %dx%d, assinatura %dx%d", (int)VIDEOWIDTH, (int)VIDEOHEIGHT, PROMPT_SIG_X1 - PROMPT_SIG_X0, PROMPT_SIG_R1 - PROMPT_SIG_R0);
 	if (!g_machine) {
 		g_machine = new CMachine();
 	}
